@@ -1,0 +1,13 @@
+{
+  "name": "device-test-runner",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Automated physical device testing suite for Remote-App",
+  "scripts": {
+    "test:contacts": "node run-device-tests.js --module contacts",
+    "test:location": "node run-device-tests.js --module location",
+    "test:camera": "node run-device-tests.js --module camera",
+    "test:screen": "node run-device-tests.js --module screen",
+    "test:all": "node run-device-tests.js --module all"
+  }
+}

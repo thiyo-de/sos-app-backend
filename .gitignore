@@ -1,0 +1,14 @@
+# --- secrets ---
+.env
+firebase-service-account.json
+*.pem
+*.pfx
+certs/
+
+# --- node ---
+node_modules/
+npm-debug.log*
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
