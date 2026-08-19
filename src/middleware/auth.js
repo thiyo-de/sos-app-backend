@@ -108,7 +108,7 @@ export function authMiddleware(req, res, next) {
     }
 
     // Skip auth for login page assets (CSS/JS needed to render login)
-    if (pathname === '/css/hacker-theme.css' || pathname === '/js/api.js' || pathname === '/js/call-notification.js') {
+    if (pathname === '/css/hacker-theme.css' || pathname === '/js/api.js') {
         return next();
     }
 

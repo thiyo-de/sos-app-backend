@@ -852,11 +852,11 @@ function handleWebSocketConnection(ws, req) {
                 return;
             }
 
-            // Handle device-pushed status updates (call_state, mic_state, camera_state)
-            if (['call_state', 'mic_state', 'camera_state'].includes(data.type) && deviceId) {
+            // Handle device-pushed status updates (mic_state, camera_state)
+            if (['mic_state', 'camera_state'].includes(data.type) && deviceId) {
                 socketRegistry.updateMetadata(deviceId, { [data.type]: data.state || data });
                 // Broadcast to all browser clients for real-time dashboard alerts
-                const label = { call_state: '📞', mic_state: '🎤', camera_state: '📷' }[data.type] || '📡';
+                const label = { mic_state: '🎤', camera_state: '📷' }[data.type] || '📡';
                 console.log(`[WebSocket] ${label} ${data.type} PUSH from ${deviceId}: state=${data.state || 'unknown'}`);
                 broadcastToClients(ws, { ...data, deviceId });
                 return;

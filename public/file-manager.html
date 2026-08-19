@@ -363,6 +363,18 @@
             font-size: 0.7rem;
         }
 
+        .err-banner {
+            margin: 10px 0 14px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 51, 51, 0.3);
+            background: rgba(255, 51, 51, 0.06);
+            color: var(--danger);
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            line-height: 1.5;
+        }
+
         .pulse-load {
             animation: pLoad 1.5s ease-in-out infinite;
         }
@@ -918,7 +930,6 @@
     </footer>
 
     <script src="/js/api.js"></script>
-    <script src="/js/call-notification.js"></script>
     <script>
         lucide.createIcons();
 
@@ -933,6 +944,8 @@
         let sortOrder = 'asc';
         // FS-014: Search filter
         let searchQuery = '';
+        // Last successfully rendered listing (restored if a navigation fails)
+        let lastLoaded = null;
 
         if (!deviceId) window.location.href = 'index.html';
 
@@ -997,11 +1010,21 @@
                     updateToolbarVisibility();
                     // Show filter bar for normal directory views
                     document.getElementById('filter-bar').style.display = currentPath.startsWith('/CATEGORY') ? 'none' : '';
+                    lastLoaded = { html: container.innerHTML, currentPath };
                 } else {
                     throw new Error(response.error || 'Failed to load files');
                 }
             } catch (error) {
                 console.error(error);
+                // Restore the last successful listing so the view doesn't hang on a spinner
+                if (lastLoaded) {
+                    container.innerHTML = lastLoaded.html + `<div class="err-banner">⚠ ${escHtml(error.message || 'Failed to load files')} — showing last loaded folder.</div>`;
+                    currentPath = lastLoaded.currentPath;
+                    renderBreadcrumb(currentPath);
+                } else {
+                    container.innerHTML = `<div class="empty"><div class="e-icon"><i data-lucide="alert-circle" style="width:48px;height:48px;"></i></div><h2>Failed to Load</h2><p>${escHtml(error.message || 'Failed to load files')}</p><p style="margin-top:12px;"><button class="tb-btn primary" onclick="loadFiles()"><i data-lucide="refresh-cw" style="width:13px;height:13px;"></i> Retry</button></p></div>`;
+                }
+                lucide.createIcons();
                 api.showToast('Failed to load files: ' + error.message, 'error');
             }
         }
@@ -1044,7 +1067,9 @@
 
             // Parent directory
             if (!isCategoryView && currentPath !== '/storage/emulated/0' && currentPath !== '/storage/emulated/0/') {
-                const parentPath = currentPath.substring(0, currentPath.lastIndexOf('/'));
+                const parentPath = (currentPath === '/storage' || currentPath === '/storage/')
+                    ? '/'
+                    : currentPath.substring(0, currentPath.lastIndexOf('/'));
                 html += `
                     <div class="file-item" onclick="loadFiles('${escJs(parentPath)}')" style="cursor:pointer">
                         <div class="f-icon parent"><i data-lucide="corner-left-up" style="width:16px;height:16px;"></i></div>
@@ -1094,7 +1119,6 @@
                     const freadable = file.readable !== undefined ? file.readable : true;
                     const fwritable = file.writable !== undefined ? file.writable : true;
 
-                    const childCount = file.childCount || file.type === 'folder' ? '' : '';
                     return `
                         <div class="file-item" data-path="${escHtml(absolutePath)}" data-type="${file.type}" data-size="${fsize}" data-date="${fdate}" data-readable="${freadable}" data-writable="${fwritable}"${file.childCount ? ` data-childcount="${file.childCount}"` : ''}>
                             <div class="f-icon ${isFolder ? 'folder' : ''}"><i data-lucide="${iconName}" style="width:16px;height:16px;"></i></div>
@@ -1115,9 +1139,20 @@
             lucide.createIcons();
         }
 
+        // Robust lookup of a rendered row by absolute path.
+        // Compares raw attribute values instead of building a CSS selector,
+        // so paths containing quotes/apostrophes are matched correctly.
+        function findFileItem(absolutePath) {
+            const items = document.querySelectorAll('.file-item[data-path]');
+            for (const it of items) {
+                if (it.getAttribute('data-path') === absolutePath) return it;
+            }
+            return null;
+        }
+
         // FS-018: Properties dialog
         function showProperties(absolutePath) {
-            const item = document.querySelector(`.file-item[data-path="${escJs(absolutePath)}"]`);
+            const item = findFileItem(absolutePath);
             if (!item) { api.showToast('File info not available', 'error'); return; }
             const name = absolutePath.split('/').pop();
             const type = item.getAttribute('data-type') || 'file';
@@ -1209,7 +1244,7 @@
                 // FS-013: Mark active volume based on currentPath
                 container.innerHTML = volumes.map(v => {
                     const isActive = currentPath.startsWith(v.path);
-                    return `<button class="tb-btn${isActive ? ' volume-active' : ''}" onclick="loadFiles('${escJs(v.path)}')" title="${escHtml(v.path)}"><i data-lucide="${v.iconName}" style="width:13px;height:13px;"></i> ${escHtml(v.label)}</button>`;
+                    return `<button class="tb-btn${isActive ? ' volume-active' : ''}" onclick="loadFiles('${escJs(v.path)}')" title="${escHtml(v.path)}" data-path="${escHtml(v.path)}"><i data-lucide="${v.iconName}" style="width:13px;height:13px;"></i> ${escHtml(v.label)}</button>`;
                 }).join('');
             }
             lucide.createIcons();
@@ -1290,7 +1325,9 @@
                     type: el.getAttribute('data-type') || 'file',
                     path: el.getAttribute('data-path') || '',
                     size: parseInt(el.getAttribute('data-size') || '0'),
-                    lastModified: parseInt(el.getAttribute('data-date') || '0')
+                    lastModified: parseInt(el.getAttribute('data-date') || '0'),
+                    readable: el.getAttribute('data-readable') === 'true',
+                    writable: el.getAttribute('data-writable') === 'true'
                 }));
                 renderFiles(files);
             }
@@ -1315,11 +1352,8 @@
             setTimeout(() => {
                 const volBtns = document.querySelectorAll('#external-storage-btns .tb-btn');
                 volBtns.forEach(btn => {
-                    const onclick = btn.getAttribute('onclick') || '';
-                    const match = onclick.match(/loadFiles\('([^']+)'\)/);
-                    if (match) {
-                        btn.classList.toggle('volume-active', currentPath.startsWith(match[1]));
-                    }
+                    const volPath = btn.getAttribute('data-path') || '';
+                    if (volPath) btn.classList.toggle('volume-active', currentPath.startsWith(volPath));
                 });
                 // Home button active state
                 document.getElementById('btn-home').classList.toggle('volume-active', currentPath === '/storage/emulated/0' || currentPath.startsWith('/storage/emulated/0/'));
@@ -1336,55 +1370,68 @@
             'btn-apks': 'installations'
         };
 
-        Object.entries(categoryTypes).forEach(([btnId, type]) => {
-            document.getElementById(btnId).addEventListener('click', async () => {
-                const container = document.getElementById('file-list');
-                
-                // Show scanning UI purely for visual feedback on large phones
-                container.innerHTML = `
-                    <div class="empty">
-                        <div class="spinner"></div>
-                        <h2>Querying Device Storage</h2>
-                        <p>Scanning all internal and external storage for ${type}...</p>
-                    </div>`;
-                lucide.createIcons();
-                document.getElementById('file-count').style.display = 'none';
+        async function loadCategory(type) {
+            const container = document.getElementById('file-list');
 
-                try {
-                    const response = await api.sendCommand(deviceId, 'files_category', { category: type });
-                    if (response.success && response.data && response.data.files) {
-                        currentPath = response.data.path || `/CATEGORY/${type.toUpperCase()}`;
-                        renderBreadcrumb(currentPath);
-                        renderFiles(response.data.files || []);
-                        updateToolbarVisibility();
+            // Show scanning UI purely for visual feedback on large phones
+            container.innerHTML = `
+                <div class="empty">
+                    <div class="spinner"></div>
+                    <h2>Querying Device Storage</h2>
+                    <p>Scanning all internal and external storage for ${escHtml(type)}...</p>
+                </div>`;
+            lucide.createIcons();
+            document.getElementById('file-count').style.display = 'none';
+
+            try {
+                const response = await api.sendCommand(deviceId, 'files_category', { category: type });
+                if (response.success && response.data && response.data.files) {
+                    currentPath = response.data.path || `/CATEGORY/${type.toUpperCase()}`;
+                    renderBreadcrumb(currentPath);
+                    renderFiles(response.data.files || []);
+                    updateToolbarVisibility();
+                    lastLoaded = { html: container.innerHTML, currentPath };
+                } else {
+                    // Check for permission error vs empty result
+                    renderBreadcrumb(`/CATEGORY/${type.toUpperCase()}`);
+                    const errMsg = (response.error || response.data?.error || '').toLowerCase();
+                    if (errMsg.includes('permission') || errMsg.includes('access denied') || errMsg.includes('mediastore')) {
+                        // FS-009: Permission denied — show guidance instead of misleading "no files"
+                        container.innerHTML = `
+                            <div class="empty">
+                                <div class="e-icon"><i data-lucide="shield-off" style="width:48px;height:48px;"></i></div>
+                                <h2>Storage Permission Required</h2>
+                                <p>Remote Access needs storage permission to scan files by category.</p>
+                                <p style="margin-top:8px;font-size:0.65rem;">On Android 11+, go to Settings → Apps → Remote Access → Permissions → Files and media → Allow.</p>
+                                <p style="margin-top:6px;font-size:0.6rem;color:var(--text-muted);">After granting permission, try again.</p>
+                            </div>`;
                     } else {
-                        // Check for permission error vs empty result
-                        renderBreadcrumb(`/CATEGORY/${type.toUpperCase()}`);
-                        const errMsg = (response.error || response.data?.error || '').toLowerCase();
-                        if (errMsg.includes('permission') || errMsg.includes('access denied') || errMsg.includes('mediastore')) {
-                            // FS-009: Permission denied — show guidance instead of misleading "no files"
-                            container.innerHTML = `
-                                <div class="empty">
-                                    <div class="e-icon"><i data-lucide="shield-off" style="width:48px;height:48px;"></i></div>
-                                    <h2>Storage Permission Required</h2>
-                                    <p>Remote Access needs storage permission to scan files by category.</p>
-                                    <p style="margin-top:8px;font-size:0.65rem;">On Android 11+, go to Settings → Apps → Remote Access → Permissions → Files and media → Allow.</p>
-                                    <p style="margin-top:6px;font-size:0.6rem;color:var(--text-muted);">After granting permission, try again.</p>
-                                </div>`;
-                        } else {
-                            container.innerHTML = `
-                                <div class="empty">
-                                    <div class="e-icon"><i data-lucide="folder-x" style="width:48px;height:48px;"></i></div>
-                                    <h2>No ${type} Found</h2>
-                                    <p>This device doesn't have any files matching this category.</p>
-                                </div>`;
-                        }
-                        lucide.createIcons();
+                        container.innerHTML = `
+                            <div class="empty">
+                                <div class="e-icon"><i data-lucide="folder-x" style="width:48px;height:48px;"></i></div>
+                                <h2>No ${escHtml(type)} Found</h2>
+                                <p>This device doesn't have any files matching this category.</p>
+                            </div>`;
                     }
-                } catch (error) {
-                    api.showToast('Failed to query category: ' + error.message, 'error');
+                    lucide.createIcons();
                 }
-            });
+            } catch (error) {
+                console.error(error);
+                // Restore the last successful listing so the view doesn't hang on a spinner
+                if (lastLoaded) {
+                    container.innerHTML = lastLoaded.html + `<div class="err-banner">⚠ ${escHtml(error.message || 'Failed to query category')} — showing last loaded folder.</div>`;
+                    currentPath = lastLoaded.currentPath;
+                    renderBreadcrumb(currentPath);
+                } else {
+                    container.innerHTML = `<div class="empty"><div class="e-icon"><i data-lucide="folder-x" style="width:48px;height:48px;"></i></div><h2>Failed to Query</h2><p>${escHtml(error.message || 'Failed to query category')}</p></div>`;
+                }
+                lucide.createIcons();
+                api.showToast('Failed to query category: ' + error.message, 'error');
+            }
+        }
+
+        Object.entries(categoryTypes).forEach(([btnId, type]) => {
+            document.getElementById(btnId).addEventListener('click', () => loadCategory(type));
         });
 
         document.getElementById('btn-trash').addEventListener('click', async () => {
@@ -1492,7 +1539,7 @@
         async function deleteFile(absolutePath) {
             const filename = absolutePath.split('/').pop();
             // FS-010: Check if target is a folder, warn about recursive deletion
-            const fileItem = document.querySelector(`.file-item[data-path="${escJs(absolutePath)}"]`);
+            const fileItem = findFileItem(absolutePath);
             const isFolder = fileItem?.getAttribute('data-type') === 'folder' || fileItem?.getAttribute('data-type') === 'directory';
             if (isFolder) {
                 // Use childCount from server (FS-010 backend) if available, otherwise fallback to separate request
@@ -1553,14 +1600,20 @@
                 });
                 if (response.success && (response.data?.status === 'success' || response.status === 'success')) {
                     api.showToast('Renamed successfully', 'success');
-                    loadFiles(currentPath);
+                    // Reload through the right path: categories must re-run files_category,
+                    // otherwise the device would resolve /CATEGORY/... as a real folder.
+                    if (currentPath.startsWith('/CATEGORY')) {
+                        loadCategory(currentPath.split('/').pop().toLowerCase());
+                    } else {
+                        loadFiles(currentPath);
+                    }
                 } else { throw new Error(response.error || response.data?.error || 'Failed to rename'); }
             } catch (error) { api.showToast(error.message, 'error'); }
         }
 
         function downloadFile(absolutePath) {
             // FS-005: Show feedback for folder downloads (zip preparation takes time)
-            const fileItem = document.querySelector(`.file-item[data-path="${escJs(absolutePath)}"]`);
+            const fileItem = findFileItem(absolutePath);
             const isFolder = fileItem?.getAttribute('data-type') === 'folder' || fileItem?.getAttribute('data-type') === 'directory';
             if (isFolder) {
                 api.showToast('Preparing zip download... Large folders may take 10-30s.', 'info');
@@ -1585,19 +1638,59 @@
 
             const header = document.createElement('div');
             header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;width:100%;max-width:800px;margin-bottom:12px;';
-            header.innerHTML = `
-                <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%;">${escHtml(filename)}</span>
-                <div style="display:flex;gap:8px;">
-                    <button onclick="downloadFile('${escJs(absolutePath)}')" style="padding:6px 14px;border-radius:6px;border:1px solid rgba(0,255,65,0.2);background:rgba(0,255,65,0.08);color:var(--accent);font-size:0.65rem;cursor:pointer;">⬇ Download</button>
-                    <button onclick="document.getElementById('preview-overlay').remove()" style="padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-secondary);font-size:0.65rem;cursor:pointer;">✕ Close</button>
-                </div>`;
+            const nameSpan = document.createElement('span');
+            nameSpan.style.cssText = 'font-family:var(--font-mono);font-size:0.7rem;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%;';
+            nameSpan.textContent = filename;
+            const headerBtns = document.createElement('div');
+            headerBtns.style.cssText = 'display:flex;gap:8px;';
+            const headerDl = document.createElement('button');
+            headerDl.style.cssText = 'padding:6px 14px;border-radius:6px;border:1px solid rgba(0,255,65,0.2);background:rgba(0,255,65,0.08);color:var(--accent);font-size:0.65rem;cursor:pointer;';
+            headerDl.textContent = '⬇ Download';
+            headerDl.addEventListener('click', () => downloadFile(absolutePath));
+            const headerClose = document.createElement('button');
+            headerClose.style.cssText = 'padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);color:var(--text-secondary);font-size:0.65rem;cursor:pointer;';
+            headerClose.textContent = '✕ Close';
+            headerClose.addEventListener('click', () => overlay.remove());
+            headerBtns.appendChild(headerDl);
+            headerBtns.appendChild(headerClose);
+            header.appendChild(nameSpan);
+            header.appendChild(headerBtns);
             overlay.appendChild(header);
 
             const content = document.createElement('div');
             content.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;max-width:800px;max-height:70vh;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;overflow:hidden;position:relative;';
-            content.innerHTML = '<div class="spinner" style="margin:60px auto;"></div>';
+            const spinner = document.createElement('div');
+            spinner.className = 'spinner';
+            spinner.style.margin = '60px auto';
+            content.appendChild(spinner);
             overlay.appendChild(content);
             document.body.appendChild(overlay);
+
+            // SECURITY: the whole modal is built with DOM APIs (createElement + textContent +
+            // addEventListener) and media URLs are assigned via the .src property. Filenames,
+            // paths and temp URLs are therefore NEVER parsed as HTML, closing the previous
+            // double-escape injection hole in the error fallback markup.
+            const showErrorCard = (title, hint, includeDownload) => {
+                content.innerHTML = '';
+                const card = document.createElement('div');
+                card.style.cssText = 'text-align:center;padding:40px;';
+                const titleEl = document.createElement('p');
+                titleEl.style.cssText = 'font-family:var(--font-display);font-size:0.8rem;color:var(--danger);';
+                titleEl.textContent = title;
+                const hintEl = document.createElement('p');
+                hintEl.style.cssText = 'font-family:var(--font-mono);font-size:0.65rem;color:var(--text-muted);margin-top:8px;';
+                hintEl.textContent = hint;
+                card.appendChild(titleEl);
+                card.appendChild(hintEl);
+                if (includeDownload) {
+                    const btn = document.createElement('button');
+                    btn.style.cssText = 'margin-top:12px;padding:8px 20px;border-radius:6px;border:1px solid rgba(0,255,65,0.2);background:rgba(0,255,65,0.08);color:var(--accent);font-size:0.7rem;cursor:pointer;';
+                    btn.textContent = '⬇ Download';
+                    btn.addEventListener('click', () => downloadFile(absolutePath));
+                    card.appendChild(btn);
+                }
+                content.appendChild(card);
+            };
 
             try {
                 const response = await api.sendCommand(deviceId, 'file_download', { path: absolutePath });
@@ -1611,24 +1704,53 @@
                 let mediaSrc;
                 if (response.data.strategy === 'temp_url' && response.data.tempFilename) {
                     // Large file — stream via temp download endpoint
-                    mediaSrc = `${api.baseURL}/api/download-temp/${response.data.tempFilename}`;
+                    mediaSrc = `${api.baseURL}/api/download-temp/${encodeURIComponent(response.data.tempFilename)}`;
                 } else if (response.data.data) {
                     // Small file — inline base64
                     mediaSrc = `data:${mime};base64,${response.data.data}`;
                 } else {
-                    throw new Error('File too large to preview inline. Use Download instead.');
+                    throw new Error('Unable to preview this file. Use Download instead.');
                 }
 
-                if (isImage) {
-                    content.innerHTML = `<img src="${mediaSrc}" style="max-width:100%;max-height:70vh;object-fit:contain;" onerror="this.onerror=null;this.parentElement.innerHTML='<div style=\\'text-align:center;padding:40px;\\'><div style=\\'font-size:2rem;margin-bottom:12px;\\'>⚠</div><p style=\\'font-family:var(--font-display);font-size:0.8rem;color:var(--text-secondary);\\'>Unsupported image format</p><p style=\\'font-family:var(--font-mono);font-size:0.65rem;color:var(--text-muted);margin-top:8px;\\'>Try downloading the file instead.</p></div>';" />`;
-                } else if (isVideo) {
-                    content.innerHTML = `<video controls autoplay style="max-width:100%;max-height:70vh;" onerror="this.parentElement.innerHTML='<div style=\\'text-align:center;padding:40px;\\'><div style=\\'font-size:2rem;margin-bottom:12px;\\'>⚠</div><p style=\\'font-family:var(--font-display);font-size:0.8rem;color:var(--text-secondary);\\'>Unsupported video codec or format</p><p style=\\'font-family:var(--font-mono);font-size:0.65rem;color:var(--text-muted);margin-top:8px;\\'>Your browser does not support this video format. Try downloading instead.</p><button onclick=\\'window.downloadFile(\"${escJs(absolutePath)}\")\\' style=\\'margin-top:12px;padding:8px 20px;border-radius:6px;border:1px solid rgba(0,255,65,0.2);background:rgba(0,255,65,0.08);color:var(--accent);font-size:0.7rem;cursor:pointer;\\'>⬇ Download</button></div>';"><source src="${mediaSrc}" type="${mime}"></video>`;
-                } else if (isAudio) {
-                    content.style.padding = '40px';
-                    content.innerHTML = `<div style="text-align:center;width:100%;"><div style="font-size:3rem;margin-bottom:16px;">🎵</div><p style="font-family:var(--font-display);font-size:0.8rem;color:var(--text-secondary);margin-bottom:16px;">${escHtml(filename)}</p><audio controls autoplay style="width:100%;max-width:400px;" onerror="this.parentElement.innerHTML+='<p style=\\'font-family:var(--font-display);font-size:0.65rem;color:var(--danger);margin-top:12px;\\'>Unsupported audio format — use Download instead.</p><button onclick=\\'window.downloadFile(\"${escJs(absolutePath)}\")\\' style=\\'margin-top:8px;padding:8px 20px;border-radius:6px;border:1px solid rgba(0,255,65,0.2);background:rgba(0,255,65,0.08);color:var(--accent);font-size:0.7rem;cursor:pointer;\\'>⬇ Download</button>';"><source src="${mediaSrc}" type="${mime}"></audio></div>`;
+                const media = document.createElement(isImage ? 'img' : isVideo ? 'video' : 'audio');
+                if (!isImage) {
+                    media.controls = true;
+                    media.autoplay = true;
                 }
+
+                content.innerHTML = '';
+                if (isAudio) {
+                    content.style.padding = '40px';
+                    const wrap = document.createElement('div');
+                    wrap.style.cssText = 'text-align:center;width:100%;';
+                    const icon = document.createElement('div');
+                    icon.style.cssText = 'font-size:3rem;margin-bottom:16px;';
+                    icon.textContent = '🎵';
+                    const label = document.createElement('p');
+                    label.style.cssText = 'font-family:var(--font-display);font-size:0.8rem;color:var(--text-secondary);margin-bottom:16px;';
+                    label.textContent = filename;
+                    media.style.cssText = 'width:100%;max-width:400px;';
+                    wrap.appendChild(icon);
+                    wrap.appendChild(label);
+                    wrap.appendChild(media);
+                    content.appendChild(wrap);
+                } else {
+                    media.style.cssText = isImage ? 'max-width:100%;max-height:70vh;object-fit:contain;' : 'max-width:100%;max-height:70vh;';
+                    content.appendChild(media);
+                }
+
+                media.src = mediaSrc;
+                media.addEventListener('error', () => {
+                    if (isImage) {
+                        showErrorCard('Unsupported image format', 'Try downloading the file instead.', true);
+                    } else if (isVideo) {
+                        showErrorCard('Unsupported video codec or format', 'Your browser does not support this video format. Try downloading instead.', true);
+                    } else {
+                        showErrorCard('Unsupported audio format', 'Use Download instead.', true);
+                    }
+                });
             } catch (error) {
-                content.innerHTML = `<div style="text-align:center;padding:40px;"><p style="font-family:var(--font-display);font-size:0.8rem;color:var(--danger);">⚠ Preview Failed</p><p style="font-family:var(--font-mono);font-size:0.65rem;color:var(--text-muted);margin-top:8px;">${escHtml(error.message)}</p><p style="font-family:var(--font-display);font-size:0.6rem;color:var(--text-muted);margin-top:12px;">Files larger than 5MB cannot be previewed inline. Use Download instead.</p></div>`;
+                showErrorCard('⚠ Preview Failed', error.message || 'Failed to load preview', true);
             }
         }
     </script>
