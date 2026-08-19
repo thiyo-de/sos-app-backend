@@ -9,6 +9,7 @@ import fs from 'fs/promises';
 import crypto from 'crypto';
 import { socketRegistry } from '../services/socketRegistry.js';
 import { commandDispatcher } from '../services/commandDispatcher.js';
+import { fcmSender } from '../services/fcmSender.js';
 import { getActivityEventsFromDB, getUserDevices, claimDevice, getCapturedNotifications, getNotifications } from '../services/database.js';
 import { uploadFileToSupabase, downloadFileFromSupabase, deleteFileFromSupabase, getFileUrl } from '../services/storage.js';
 import config from '../config.js';
@@ -745,6 +746,22 @@ router.delete('/device/:deviceId/notifications', async (req, res) => {
         console.error(`[Admin] Error deleting notifications from DB for ${deviceId}:`, err.message);
         res.status(500).json({ success: false, error: 'Failed to delete notifications from Supabase' });
     }
+});
+
+/**
+ * POST /api/device/:deviceId/wake - Send FCM push to wake a killed device
+ */
+router.post('/device/:deviceId/wake', async (req, res) => {
+    const { deviceId } = req.params;
+    const device = socketRegistry.getDevice(deviceId);
+    const fcmToken = device?.metadata?.fcmToken;
+
+    if (!fcmToken) {
+        return res.json({ success: false, error: 'No FCM token — device never registered with push support' });
+    }
+
+    const sent = await fcmSender.wakeDevice(fcmToken, deviceId);
+    res.json({ success: sent, message: sent ? 'Wake push sent — device should reconnect in ~10s' : 'FCM push failed' });
 });
 
 export default router;

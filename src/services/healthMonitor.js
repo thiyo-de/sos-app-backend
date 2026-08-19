@@ -7,6 +7,7 @@
  */
 
 import { socketRegistry } from './socketRegistry.js';
+import { fcmSender } from './fcmSender.js';
 
 class HealthMonitor {
     constructor(socketRegistry) {
@@ -65,6 +66,12 @@ class HealthMonitor {
                 if (!wsAlive && (device.status === 'online' || device.status === 'sleep')) {
                     console.log(`[HealthMonitor] 🧟 Zombie socket detected for ${device.deviceId} — status was "${device.status}" but WS is dead`);
 
+                    // Try FCM wake push
+                    const fcmToken = deviceConn.metadata?.fcmToken;
+                    if (fcmToken) {
+                        fcmSender.wakeDevice(fcmToken, device.deviceId).catch(() => { });
+                    }
+
                     this.registry.markOffline(device.deviceId);
                     zombieCount++;
                     continue; // Skip further checks for this device
@@ -81,6 +88,12 @@ class HealthMonitor {
             // Tier 2: 5 min → truly offline (force disconnect)
             if (elapsed > this.OFFLINE_TIMEOUT_MS) {
                 console.log(`[HealthMonitor] ⚠️ Device ${device.deviceId} OFFLINE (${Math.round(elapsed / 1000)}s since last heartbeat)`);
+
+                // Try FCM wake push BEFORE marking offline
+                const fcmToken = deviceConn?.metadata?.fcmToken;
+                if (fcmToken) {
+                    fcmSender.wakeDevice(fcmToken, device.deviceId).catch(() => { });
+                }
 
                 // Force disconnect
                 if (deviceConn && deviceConn.ws) {
