@@ -920,6 +920,9 @@
       // Kill switch
       html += `<button class="act dng" onclick="killSwitch('${id}')"><span class="ic"><i data-lucide="shield-off" style="width:16px;height:16px;"></i></span>Kill</button>`;
 
+      // Wake up (manual FCM push)
+      html += `<button class="act" onclick="wakeDevice('${id}')"><span class="ic"><i data-lucide="zap" style="width:16px;height:16px;"></i></span>Wake</button>`;
+
       if (dev.status === 'offline') {
         html += `<button class="act dng" onclick="deleteDevice('${id}')"><span class="ic"><i data-lucide="trash-2" style="width:16px;height:16px;"></i></span>Delete</button>`;
       }
@@ -1006,6 +1009,13 @@
         await api.sendCommand(id, 'kill_switch');
         api.showToast('Kill switch executed', 'success');
       } catch (e) { api.showToast('Kill failed: ' + e.message, 'error'); }
+    }
+
+    async function wakeDevice(id) {
+      try {
+        const res = await api.request(`/device/${id}/wake`, { method: 'POST' });
+        api.showToast(res.message || 'Wake push sent', res.success ? 'success' : 'error');
+      } catch (e) { api.showToast('Wake failed: ' + e.message, 'error'); }
     }
 
     // Live WebSocket

@@ -13,6 +13,16 @@ vi.mock('nodemailer', () => ({
     },
 }));
 
+vi.mock('../config.js', () => ({
+    default: {
+        email: {
+            get user() { return process.env.EMAIL_USER || ''; },
+            get appPassword() { return process.env.EMAIL_APP_PASSWORD || ''; },
+            get to() { return process.env.EMAIL_TO || ''; },
+        },
+    },
+}));
+
 async function loadNotifierWithEnv(envVars = {}) {
     vi.resetModules();
     for (const [k, v] of Object.entries(envVars)) {
