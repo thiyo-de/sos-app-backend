@@ -275,7 +275,7 @@
         <div class="notif-list" id="notifList">
             <div class="empty">
                 <i data-lucide="bell-off" style="width:48px;height:48px;margin:0 auto"></i>
-                <p>No notifications yet. Click <b>Refresh</b> or enable <b>Live Feed</b>.</p>
+                <p>No notifications yet. They appear here automatically.</p>
             </div>
         </div>
 
@@ -444,7 +444,7 @@
                     if (d.details && Array.isArray(d.details)) {
                         html += d.details.map(det => `
                             <div class="modal-detail ${det.success ? 'success' : 'failed'}">
-                                ${det.success ? '✓' : '✗'} ${det.packageName} (${det.reason || 'dismissed'})
+                                ${det.success ? '✓' : '✗'} ${escHtml(det.packageName)} (${escHtml(det.reason || 'dismissed')})
                             </div>
                         `).join('');
                     }
@@ -480,7 +480,10 @@
         function renderNotifications() {
             const list = document.getElementById('notifList');
             const filtered = appFilter ? notifications.filter(n => (n.appName || n.packageName) === appFilter) : notifications;
-            document.getElementById('countBadge').textContent = `${filtered.length} NOTIFICATION${filtered.length !== 1 ? 'S' : ''}`;
+            const total = notifications.length;
+            document.getElementById('countBadge').textContent = total === filtered.length
+                ? `${filtered.length} NOTIFICATION${filtered.length !== 1 ? 'S' : ''}`
+                : `${filtered.length}/${total} NOTIFICATION${total !== 1 ? 'S' : ''}`;
             updateFilterDropdown();
             if (filtered.length === 0) {
                 list.innerHTML = `<div class="empty"><p>No notifications${appFilter ? ' for this app' : ''}.</p></div>`;
@@ -520,13 +523,24 @@
                 document.getElementById('btnCapturedRefresh').textContent = '↻ Loading...';
                 const res = await fetch(`/api/notifications/captured?deviceId=${encodeURIComponent(deviceId)}&limit=200`, { credentials: 'same-origin' });
                 const d = await res.json();
-                captured = d.notifications || [];
-                renderCaptured();
+                mergeCaptured(d.notifications || []);
             } catch (e) {
                 api.showToast('Failed to load captured feed: ' + e.message, 'error');
             } finally {
                 document.getElementById('btnCapturedRefresh').textContent = '↻ Refresh';
             }
+        }
+
+        // Merge DB rows with any not-yet-saved live rows so refetches never drop them
+        function mergeCaptured(dbRows) {
+            const liveRows = captured.filter(r => String(r.id).startsWith('live-'));
+            const merged = [...dbRows];
+            for (const lr of liveRows) {
+                const exists = merged.some(r => r.key === lr.key && r.message === lr.message);
+                if (!exists) merged.push(lr);
+            }
+            captured = merged;
+            renderCaptured();
         }
 
         function renderCaptured() {
@@ -601,6 +615,7 @@
                 document.getElementById('reconnectStatus').classList.remove('visible');
                 if (!wasReconnect) api.showToast('Live feed connected', 'success');
                 refetchCapturedSilent();
+                checkListenerStatus();
             };
             ws.onmessage = (e) => {
                 try {
@@ -624,21 +639,32 @@
                         // New captured notification → live insert into the feed
                         const notif = data.notification;
                         if (notif.event === 'posted' || !notif.event) {
-                            const row = {
-                                id: 'live-' + Date.now(),
-                                app_name: notif.appName || notif.packageName,
-                                package_name: notif.packageName,
-                                title: notif.title,
-                                message: notif.bigText || notif.text || notif.title || '',
-                                post_time: notif.timestamp || Date.now(),
-                            };
-                            captured.unshift(row);
-                            renderCaptured();
-                            const el = document.getElementById(`cap-${CSS.escape(row.id)}`);
-                            if (el) el.classList.add('live');
+                            const msg = [notif.bigText, notif.text].filter(Boolean).join('\n') || notif.title || '(no text)';
+                            const isDup = captured.some(n => n.key === notif.key && n.message === msg);
+                            if (!isDup) {
+                                const row = {
+                                    id: 'live-' + Date.now(),
+                                    key: notif.key,
+                                    app_name: notif.appName || notif.packageName,
+                                    package_name: notif.packageName,
+                                    title: notif.title,
+                                    message: msg,
+                                    post_time: notif.timestamp || Date.now(),
+                                };
+                                captured.unshift(row);
+                                renderCaptured();
+                                const el = document.getElementById(`cap-${CSS.escape(row.id)}`);
+                                if (el) el.classList.add('live');
+                            }
+                            // Live-update the active list too (one row per key, latest wins)
+                            notifications = notifications.filter(n => n.key !== notif.key);
+                            notifications.unshift(notif);
+                            renderNotifications();
                         } else if (notif.event === 'removed') {
                             captured = captured.filter(n => n.key !== notif.key);
                             renderCaptured();
+                            notifications = notifications.filter(n => n.key !== notif.key);
+                            renderNotifications();
                         }
                     }
                 } catch (_) {}
@@ -646,7 +672,7 @@
             ws.onclose = () => {
                 isLive = false;
                 ws = null;
-                updateLiveIndicator('connecting');
+                updateLiveIndicator('offline');
                 scheduleReconnect();
             };
             ws.onerror = () => {
