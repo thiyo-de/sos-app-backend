@@ -33,7 +33,7 @@ function resolvePublicUrl() {
   if (process.env.RENDER_URL) {
     return process.env.RENDER_URL.replace(/\/+$/, '');
   }
-  return 'https://rat-backend-hhjv.onrender.com';
+  return 'https://sos-app-backend.onrender.com';
 }
 
 function resolveWebSocketUrl() {
