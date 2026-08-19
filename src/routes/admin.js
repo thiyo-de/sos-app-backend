@@ -662,4 +662,20 @@ router.delete('/device/:deviceId/activities', async (req, res) => {
     res.json({ success: true, message: `Activity cache cleared for ${deviceId}` });
 });
 
+/**
+ * DELETE /api/device/:deviceId/notifications - Delete all notification records from Supabase
+ */
+router.delete('/device/:deviceId/notifications', async (req, res) => {
+    const { deviceId } = req.params;
+
+    try {
+        const { deleteCapturedNotificationsFromDB } = await import('../services/database.js');
+        await deleteCapturedNotificationsFromDB(deviceId);
+        res.json({ success: true, message: `All notifications deleted for ${deviceId}` });
+    } catch (err) {
+        console.error(`[Admin] Error deleting notifications from DB for ${deviceId}:`, err.message);
+        res.status(500).json({ success: false, error: 'Failed to delete notifications from Supabase' });
+    }
+});
+
 export default router;

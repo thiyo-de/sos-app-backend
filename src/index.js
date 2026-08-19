@@ -739,12 +739,20 @@ function handleWebSocketConnection(ws, req) {
                 if (notif.event === 'removed') {
                     // Removal events just forward to the dashboard (no DB write)
                     broadcastToClients(ws, { type: 'notification_event', deviceId, notification: notif });
+                    if (notif.uuid) safeSend(ws, { type: 'event_ack', deviceId, ids: [notif.uuid] });
                     return;
                 }
-                // Persist to Supabase (fire & forget, deduped on key)
-                saveCapturedNotification(deviceId, notif);
-                // Live-broadcast to the dashboard feed
+                // Live-broadcast to the dashboard feed (immediate)
                 broadcastToClients(ws, { type: 'notification_event', deviceId, notification: notif });
+                // Persist to Supabase; ACK only after the row is written so the
+                // phone outbox can drop it (at-least-once + content-hash dedup).
+                saveCapturedNotification(deviceId, notif).then(saved => {
+                    if (saved && notif.uuid) {
+                        safeSend(ws, { type: 'event_ack', deviceId, ids: [notif.uuid] });
+                    } else if (!saved) {
+                        console.warn(`[WebSocket] notification_event NOT persisted for ${deviceId} — phone will retry`);
+                    }
+                });
                 return;
             }
 
@@ -907,7 +915,7 @@ function handleWebSocketConnection(ws, req) {
             if (data.type === 'activity_data' && deviceId) {
                 const events = data.events || [];
                 if (events.length > 0) {
-                    // Store in memory
+                    // Store in memory (live dashboard read path)
                     if (!global.activityCache) global.activityCache = new Map();
                     let cached = global.activityCache.get(deviceId);
                     if (!cached) {
@@ -922,30 +930,30 @@ function handleWebSocketConnection(ws, req) {
                         global.activityCache.set(deviceId, cached.slice(0, 2000));
                     }
 
-                    // Persist to DB (throttled — raw capture generates tons of events)
-                    // Each tick saves the NEWEST unsaved events and drops them from
-                    // the memory cache, so no event is ever saved twice.
-                    if (!global._activitySaveTimer) {
-                        global._activitySaveTimer = setTimeout(() => {
-                            global._activitySaveTimer = null;
-                            import('./services/database.js').then(async db => {
-                                const cache = global.activityCache;
-                                if (cache) {
-                                    for (const [devId, events] of cache.entries()) {
-                                        const toSave = events.slice(0, 200);
-                                        if (toSave.length === 0) continue;
-                                        try {
-                                            const ok = await db.saveActivityEvents(devId, toSave);
-                                            if (ok) {
-                                                const current = cache.get(devId);
-                                                if (current) current.splice(0, toSave.length);
-                                            }
-                                        } catch (_) { /* keep them for the next tick */ }
+                    // Persist immediately — the phone outbox retries until it gets
+                    // an event_ack, and event_uuid dedup makes re-sends harmless.
+                    const uuids = events.map(ev => ev.uuid).filter(Boolean);
+                    import('./services/database.js').then(async db => {
+                        try {
+                            const ok = await db.saveActivityEvents(deviceId, events);
+                            if (ok) {
+                                // Drop persisted events from the live cache (avoids duplicates vs DB reads)
+                                if (uuids.length > 0) {
+                                    const persisted = new Set(uuids);
+                                    const current = global.activityCache?.get(deviceId);
+                                    if (current) {
+                                        const remaining = current.filter(c => !persisted.has(c.uuid));
+                                        if (remaining.length !== current.length) {
+                                            global.activityCache.set(deviceId, remaining);
+                                        }
                                     }
+                                    safeSend(ws, { type: 'event_ack', deviceId, ids: uuids });
                                 }
-                            }).catch(() => { });
-                        }, 30000); // Save at most every 30s
-                    }
+                            } else {
+                                console.warn(`[WebSocket] activity_data NOT persisted for ${deviceId} (${events.length} events) — phone will retry`);
+                            }
+                        } catch (_) { /* no ack → phone retries */ }
+                    }).catch(() => { /* no ack → phone retries */ });
 
                     // Broadcast to browser clients for live feed
                     broadcastToClients(ws, { type: 'activity_data', deviceId, events, count: events.length });

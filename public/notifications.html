@@ -105,6 +105,22 @@
         .toolbar button.danger { border-color: rgba(255,68,68,0.4); color: #ff6b6b; }
         .toolbar button.danger:hover { background: rgba(255,68,68,0.1); }
 
+        /* ── LIVE INDICATOR (always-on feed) ── */
+        .live-indicator {
+            display: flex; align-items: center; gap: 6px;
+            padding: 6px 12px; border-radius: 6px;
+            background: var(--bg-panel); border: 1px solid var(--border);
+            font-size: 0.65rem; font-weight: 700; letter-spacing: 1px; color: var(--text-muted);
+        }
+        .live-indicator .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0; }
+        .live-indicator.connected { border-color: rgba(0,255,65,0.4); color: var(--accent); }
+        .live-indicator.connected .live-dot { background: #00ff41; box-shadow: 0 0 6px #00ff41; animation: livePulse 1.6s ease-in-out infinite; }
+        .live-indicator.connecting { border-color: rgba(255,170,0,0.4); color: #ffaa00; }
+        .live-indicator.connecting .live-dot { background: #ffaa00; box-shadow: 0 0 6px #ffaa00; animation: livePulse 1.6s ease-in-out infinite; }
+        .live-indicator.offline { border-color: rgba(255,68,68,0.4); color: #ff6b6b; }
+        .live-indicator.offline .live-dot { background: #ff6b6b; }
+        @keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
         /* ── CLEAR ALL RESULT MODAL ── */
         .modal-overlay {
             position: fixed; inset: 0; background: rgba(0,0,0,0.7);
@@ -246,7 +262,7 @@
             <select id="filterApp" onchange="applyFilter()">
                 <option value="">All Apps</option>
             </select>
-            <button onclick="toggleLive()" id="btnLive">◉ Live Feed</button>
+            <span class="live-indicator connecting" id="liveIndicator"><span class="live-dot"></span> CONNECTING</span>
         </div>
 
         <!-- Live Reconnect Status -->
@@ -270,6 +286,7 @@
         </div>
         <div class="toolbar">
             <button onclick="fetchCaptured()" id="btnCapturedRefresh">↻ Refresh</button>
+            <button onclick="deleteAllCaptured()" class="danger" id="btnCapturedDelete">🗑 Delete All from Cloud</button>
             <span style="font-size:0.6rem;color:var(--text-muted);align-self:center">TIME | MESSAGE | APP NAME</span>
         </div>
         <div class="captured-list" id="capturedList">
@@ -531,18 +548,59 @@
             }).join('');
         }
 
-        // ── Live Feed with Auto-Reconnect ──
-        function toggleLive() { isLive ? stopLive() : startLive(); }
+        // ── Delete all from Supabase ──
+        async function deleteAllCaptured() {
+            if (!confirm('Delete ALL captured + lifecycle notifications for this device from the cloud (Supabase)? This cannot be undone.')) return;
+            try {
+                const btn = document.getElementById('btnCapturedDelete');
+                btn.textContent = '🗑 Deleting...';
+                btn.disabled = true;
+                const resp = await fetch(`/api/device/${encodeURIComponent(deviceId)}/notifications`, {
+                    method: 'DELETE',
+                    headers: { 'X-CSRF-Token': api.csrfToken || '' },
+                    credentials: 'same-origin',
+                });
+                const d = await resp.json();
+                btn.textContent = '🗑 Delete All from Cloud';
+                btn.disabled = false;
+                if (d.success) {
+                    captured = [];
+                    renderCaptured();
+                    api.showToast('All notifications deleted from Supabase', 'success');
+                } else {
+                    api.showToast('Failed: ' + (d.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                document.getElementById('btnCapturedDelete').textContent = '🗑 Delete All from Cloud';
+                document.getElementById('btnCapturedDelete').disabled = false;
+                api.showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        // ── Live Feed (always-on, auto-reconnect) ──
+        function updateLiveIndicator(state) {
+            const el = document.getElementById('liveIndicator');
+            if (!el) return;
+            el.classList.remove('connected', 'connecting', 'offline');
+            el.classList.add(state);
+            const label = state === 'connected' ? 'LIVE' : state === 'connecting' ? 'CONNECTING' : 'OFFLINE';
+            el.innerHTML = `<span class="live-dot"></span> ${label}`;
+        }
+
         function startLive() {
-            const btn = document.getElementById('btnLive');
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+            updateLiveIndicator('connecting');
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}`);
             ws.onopen = () => {
                 ws.send(JSON.stringify({ type: 'identify', role: 'browser' }));
-                isLive = true; btn.classList.add('active'); btn.textContent = '◉ Live (ON)';
+                const wasReconnect = wsReconnectAttempts > 0;
+                isLive = true;
                 wsReconnectAttempts = 0;
+                updateLiveIndicator('connected');
                 document.getElementById('reconnectStatus').classList.remove('visible');
-                api.showToast('Live feed connected', 'success');
+                if (!wasReconnect) api.showToast('Live feed connected', 'success');
+                refetchCapturedSilent();
             };
             ws.onmessage = (e) => {
                 try {
@@ -587,16 +645,12 @@
             };
             ws.onclose = () => {
                 isLive = false;
-                btn.classList.remove('active');
-                btn.textContent = '◉ Live Feed';
-                if (wsReconnectAttempts < 5) {
-                    scheduleReconnect();
-                } else {
-                    api.showToast('Live feed disconnected (max retries)', 'error');
-                }
+                ws = null;
+                updateLiveIndicator('connecting');
+                scheduleReconnect();
             };
             ws.onerror = () => {
-                api.showToast('WebSocket error', 'error');
+                updateLiveIndicator('connecting');
                 if (ws) {
                     try { ws.close(); } catch (_) {}
                     ws = null;
@@ -608,19 +662,20 @@
             wsReconnectAttempts++;
             const delay = Math.min(1000 * Math.pow(2, wsReconnectAttempts - 1), 30000);
             document.getElementById('reconnectStatus').classList.add('visible');
-            document.getElementById('reconnectText').textContent = `Reconnecting in ${Math.round(delay/1000)}s (attempt ${wsReconnectAttempts}/5)...`;
+            document.getElementById('reconnectText').textContent = `Reconnecting in ${Math.round(delay/1000)}s (attempt ${wsReconnectAttempts})...`;
             wsReconnectTimer = setTimeout(() => {
                 if (!isLive) startLive();
             }, delay);
         }
 
-        function stopLive() {
-            if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-            if (ws) { ws.close(); ws = null; }
-            isLive = false;
-            document.getElementById('btnLive').classList.remove('active');
-            document.getElementById('btnLive').textContent = '◉ Live Feed';
-            document.getElementById('reconnectStatus').classList.remove('visible');
+        // Silent catch-up after (re)connect — merges anything saved to Supabase during downtime
+        async function refetchCapturedSilent() {
+            try {
+                const res = await fetch(`/api/notifications/captured?deviceId=${encodeURIComponent(deviceId)}&limit=200`, { credentials: 'same-origin' });
+                const d = await res.json();
+                captured = d.notifications || [];
+                renderCaptured();
+            } catch (_) {}
         }
 
         // ── Init ──
@@ -628,6 +683,7 @@
         checkListenerStatus();
         fetchNotifications();
         fetchCaptured();
+        startLive();
     </script>
 </body>
 </html>

