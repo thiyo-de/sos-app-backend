@@ -3,7 +3,8 @@
  * 
  * Two-tier timeout:
  * - 90s no heartbeat → "sleeping" (device may still be alive, OEM throttling)
- * - 5 min no heartbeat → "offline" (OEM killed the process)
+ * - 2 min no heartbeat → "offline" (OEM killed the process)
+ *   → Sends FCM wake push before marking offline
  */
 
 import { socketRegistry } from './socketRegistry.js';
@@ -14,7 +15,7 @@ class HealthMonitor {
         this.registry = socketRegistry;
         this.CHECK_INTERVAL = 30000; // Check every 30s
         this.SLEEP_TIMEOUT_MS = 90000; // 90s → sleeping (may be alive but unresponsive)
-        this.OFFLINE_TIMEOUT_MS = 300000; // 5 min → truly offline (process likely killed)
+        this.OFFLINE_TIMEOUT_MS = 120000; // 2 min → offline (OEM likely killed the process)
         this.monitorInterval = null;
     }
 

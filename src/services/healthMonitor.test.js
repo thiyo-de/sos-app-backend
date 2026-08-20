@@ -23,7 +23,7 @@ describe('healthMonitor', () => {
     it('has default timeout constants', () => {
       expect(monitor.CHECK_INTERVAL).toBe(30000);
       expect(monitor.SLEEP_TIMEOUT_MS).toBe(90000);
-      expect(monitor.OFFLINE_TIMEOUT_MS).toBe(300000);
+      expect(monitor.OFFLINE_TIMEOUT_MS).toBe(120000);
     });
   });
 
@@ -55,7 +55,7 @@ describe('healthMonitor', () => {
       expect(registry.markOffline).not.toHaveBeenCalled();
     });
 
-    it('marks offline when heartbeat older than 5 min', () => {
+    it('marks offline when heartbeat older than 2 min', () => {
       const now = Date.now();
       const dead = {
         deviceId: 'dev2',

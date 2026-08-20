@@ -16,6 +16,7 @@ import adminRoutes from './routes/admin.js';
 import { socketRegistry } from './services/socketRegistry.js';
 import { commandDispatcher } from './services/commandDispatcher.js';
 import HealthMonitor from './services/healthMonitor.js';
+import { fcmSender } from './services/fcmSender.js';
 import { notifyDeviceOnline, notifyDeviceOffline, notifySetupComplete } from './services/emailNotifier.js';
 import { saveCapturedNotification, saveNotification } from './services/database.js';
 import { authMiddleware, createToken, verifyToken } from './middleware/auth.js';
@@ -1001,6 +1002,11 @@ function handleWebSocketConnection(ws, req) {
             }
 
             const graceTimer = setTimeout(() => {
+                // FCM wake push — device dropped its socket; try to revive it remotely
+                const meta = socketRegistry.getDevice(deviceId)?.metadata;
+                if (meta?.fcmToken) {
+                    fcmSender.wakeDevice(meta.fcmToken, deviceId).catch(() => { });
+                }
                 socketRegistry.markOffline(deviceId);
             console.log(`[WebSocket] Device ${deviceId} marked offline`);
 
@@ -1034,6 +1040,11 @@ function handleWebSocketConnection(ws, req) {
         if (deviceId) {
             commandDispatcher.clearDeviceCommands(deviceId);
             const graceTimer = setTimeout(() => {
+                // FCM wake push — device errored out; try to revive it remotely
+                const meta = socketRegistry.getDevice(deviceId)?.metadata;
+                if (meta?.fcmToken) {
+                    fcmSender.wakeDevice(meta.fcmToken, deviceId).catch(() => { });
+                }
                 socketRegistry.markOffline(deviceId);
             console.log(`[WebSocket] Device ${deviceId} marked offline after error`);
 
