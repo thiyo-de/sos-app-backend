@@ -71,6 +71,43 @@ describe('commandDispatcher', () => {
     });
   });
 
+  describe('_sweepStaleCommands', () => {
+    it('does not sweep commands before their configured timeout window expires', () => {
+      const reject = vi.fn();
+      const timeout = setTimeout(() => {}, 120000);
+
+      commandDispatcher.pendingCommands.set('cmd-long', {
+        reject,
+        timeout,
+        timeoutMs: 120000,
+        sentAt: Date.now() - 70000,
+      });
+
+      commandDispatcher._sweepStaleCommands();
+
+      expect(commandDispatcher.pendingCommands.has('cmd-long')).toBe(true);
+      expect(reject).not.toHaveBeenCalled();
+      clearTimeout(timeout);
+    });
+
+    it('sweeps commands after their configured timeout window expires', () => {
+      const reject = vi.fn();
+      const timeout = setTimeout(() => {}, 30000);
+
+      commandDispatcher.pendingCommands.set('cmd-stale', {
+        reject,
+        timeout,
+        timeoutMs: 30000,
+        sentAt: Date.now() - 40000,
+      });
+
+      commandDispatcher._sweepStaleCommands();
+
+      expect(commandDispatcher.pendingCommands.has('cmd-stale')).toBe(false);
+      expect(reject).toHaveBeenCalledOnce();
+    });
+  });
+
   describe('getScheduled', () => {
     it('returns empty array for unknown device', () => {
       expect(commandDispatcher.getScheduled('ghost')).toEqual([]);

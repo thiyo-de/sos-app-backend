@@ -52,7 +52,8 @@ class CommandDispatcher {
         const now = Date.now();
         let swept = 0;
         for (const [commandId, pending] of this.pendingCommands.entries()) {
-            if (now - pending.sentAt > 60_000) {
+            const staleAfterMs = (pending.timeoutMs || 60_000) + 5_000;
+            if (now - pending.sentAt > staleAfterMs) {
                 clearTimeout(pending.timeout);
                 pending.reject(new Error(`Command ${commandId} stale — removed by periodic sweep`));
                 this.pendingCommands.delete(commandId);
@@ -163,6 +164,7 @@ class CommandDispatcher {
             this.pendingCommands.set(commandId, {
                 resolve, reject,
                 timeout: timeoutHandle,
+                timeoutMs: timeout,
                 deviceId, action, payload,
                 sentAt: Date.now(),
             });
@@ -224,6 +226,7 @@ class CommandDispatcher {
                 resolve,
                 reject,
                 timeout: timeoutHandle,
+                timeoutMs: timeout,
                 deviceId,
                 action,
                 payload,

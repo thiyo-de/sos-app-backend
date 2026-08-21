@@ -99,14 +99,26 @@ describe('socketRegistry', () => {
       expect(list.find(d => d.deviceId === 'devB')).toBeDefined();
     });
 
-    it('auto-fixes stale online status when WS is dead', () => {
+    it('does not mutate status while listing devices', () => {
       const ws = { OPEN: 1, readyState: 1, close: vi.fn() };
       socketRegistry.register('ghost', ws);
       ws.readyState = 3;
 
       const list = socketRegistry.listDevices();
       const ghost = list.find(d => d.deviceId === 'ghost');
-      expect(ghost.status).toBe('offline');
+      expect(ghost.status).toBe('online');
+      expect(socketRegistry.getDevice('ghost').metadata.status).toBe('online');
+    });
+
+    it('reports a live socket as online when metadata is stale offline', () => {
+      const ws = { OPEN: 1, readyState: 1, close: vi.fn() };
+      socketRegistry.register('stale', ws);
+      socketRegistry.getDevice('stale').metadata.status = 'offline';
+
+      const list = socketRegistry.listDevices();
+      const stale = list.find(d => d.deviceId === 'stale');
+      expect(stale.status).toBe('online');
+      expect(socketRegistry.getDevice('stale').metadata.status).toBe('offline');
     });
   });
 
@@ -159,9 +171,24 @@ describe('socketRegistry', () => {
       const timer = setTimeout(() => {}, 99999);
       socketRegistry.setPendingOffline('timerdev', timer);
       expect(socketRegistry.pendingOfflineTimers.has('timerdev')).toBe(true);
+      expect(socketRegistry.hasPendingOffline('timerdev')).toBe(true);
 
       socketRegistry.cancelPendingOffline('timerdev');
       expect(socketRegistry.pendingOfflineTimers.has('timerdev')).toBe(false);
+      expect(socketRegistry.hasPendingOffline('timerdev')).toBe(false);
+    });
+  });
+
+  describe('isCurrentSocket', () => {
+    it('matches only the active socket for a device', () => {
+      const oldWs = { OPEN: 1, readyState: 1, close: vi.fn() };
+      const newWs = { OPEN: 1, readyState: 1, close: vi.fn() };
+
+      socketRegistry.register('dev', oldWs);
+      socketRegistry.register('dev', newWs);
+
+      expect(socketRegistry.isCurrentSocket('dev', oldWs)).toBe(false);
+      expect(socketRegistry.isCurrentSocket('dev', newWs)).toBe(true);
     });
   });
 });

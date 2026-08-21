@@ -107,9 +107,14 @@ class SocketRegistry {
     /**
      * Mark device as offline (don't delete - keep history)
      */
-    markOffline(deviceId) {
+    markOffline(deviceId, expectedWs = null) {
         const device = this.devices.get(deviceId);
         if (device) {
+            if (expectedWs && device.ws !== expectedWs) {
+                console.log(`[Registry] Ignoring stale offline mark for ${deviceId}`);
+                return false;
+            }
+
             device.metadata.status = 'offline';
             device.metadata.lastSeen = new Date().toISOString();
             device.ws = null; // Remove socket reference
@@ -130,7 +135,9 @@ class SocketRegistry {
             } catch (e) {
                 console.error(`[Registry] Offline listener error: ${e.message}`);
             }
+            return true;
         }
+        return false;
     }
 
     /**
@@ -197,19 +204,14 @@ class SocketRegistry {
     listDevices() {
         const deviceList = [];
         for (const [deviceId, device] of this.devices.entries()) {
-            // Reconcile metadata.status with actual WebSocket state
-            // Prevents phantom "online" when WS dropped without triggering close
-            if (device.metadata.status === 'online' || device.metadata.status === 'sleep') {
-                const wsAlive = device.ws && device.ws.readyState === 1; // 1 = OPEN
-                if (!wsAlive) {
-                    device.metadata.status = 'offline';
-                    device.ws = null;
-                }
-            }
-
+            const wsAlive = device.ws && device.ws.readyState === 1;
+            const status = wsAlive && device.metadata.status === 'offline'
+                ? 'online'
+                : device.metadata.status;
             deviceList.push({
                 deviceId,
                 ...device.metadata,
+                status,
             });
         }
         return deviceList;
@@ -238,10 +240,6 @@ class SocketRegistry {
                     ...device.metadata,
                     status: 'online', // Guaranteed correct since WS is alive
                 });
-            } else if (device.metadata.status === 'online' || device.metadata.status === 'sleep') {
-                // Auto-correct stale metadata
-                device.metadata.status = 'offline';
-                device.ws = null;
             }
         }
         return onlineDevices;
@@ -262,6 +260,21 @@ class SocketRegistry {
         // Cancel any existing timer first
         this.cancelPendingOffline(deviceId);
         this.pendingOfflineTimers.set(deviceId, timer);
+    }
+
+    /**
+     * Check whether a reconnect grace timer is active.
+     */
+    hasPendingOffline(deviceId) {
+        return this.pendingOfflineTimers.has(deviceId);
+    }
+
+    /**
+     * Check if the given socket is still the active device socket.
+     */
+    isCurrentSocket(deviceId, ws) {
+        const device = this.devices.get(deviceId);
+        return !!device && device.ws === ws;
     }
 
     /**

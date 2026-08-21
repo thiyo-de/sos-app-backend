@@ -11,6 +11,7 @@ describe('healthMonitor', () => {
       getDevice: vi.fn(),
       markOffline: vi.fn(),
       markSleep: vi.fn(),
+      hasPendingOffline: vi.fn(() => false),
     };
     monitor = new HealthMonitor(registry);
   });
@@ -85,6 +86,21 @@ describe('healthMonitor', () => {
 
       monitor.checkDeviceHealth();
       expect(registry.markOffline).toHaveBeenCalledWith('dev3');
+    });
+
+    it('does not mark zombie sockets offline during reconnect grace', () => {
+      const zombie = {
+        deviceId: 'dev3',
+        status: 'online',
+        lastSeen: new Date().toISOString(),
+      };
+      const conn = { ws: null, metadata: { fcmToken: null } };
+      registry.listDevices.mockReturnValue([zombie]);
+      registry.getDevice.mockReturnValue(conn);
+      registry.hasPendingOffline.mockReturnValue(true);
+
+      monitor.checkDeviceHealth();
+      expect(registry.markOffline).not.toHaveBeenCalled();
     });
 
     it('skips already-offline devices', () => {

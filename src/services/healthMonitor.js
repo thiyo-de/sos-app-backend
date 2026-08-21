@@ -65,6 +65,10 @@ class HealthMonitor {
             if (deviceConn) {
                 const wsAlive = deviceConn.ws && deviceConn.ws.readyState === 1; // 1 = OPEN
                 if (!wsAlive && (device.status === 'online' || device.status === 'sleep')) {
+                    if (this.registry.hasPendingOffline?.(device.deviceId)) {
+                        continue;
+                    }
+
                     console.log(`[HealthMonitor] 🧟 Zombie socket detected for ${device.deviceId} — status was "${device.status}" but WS is dead`);
 
                     // Try FCM wake push

@@ -401,6 +401,7 @@ const deviceViewerCounts = new Map();
 const viewerToDevice = new Map(); // ws → deviceId being watched
 const activeLiveSessions = new Map(); // LOC-009: deviceId → { intervalMs, startTime, pendingClearTimeout }
 const LIVE_SESSION_GRACE_MS = 45_000; // LOC-009: grace period before clearing session on disconnect
+const DEVICE_OFFLINE_GRACE_MS = LIVE_SESSION_GRACE_MS;
 
 /**
  * Broadcast viewer count updates to all dashboard clients
@@ -424,6 +425,46 @@ function broadcastViewerCount(deviceId) {
     };
     doBroadcast(wss);
     doBroadcast(wssHttps);
+}
+
+function cleanupViewerTracking(ws) {
+    const watchedDevice = viewerToDevice.get(ws);
+    if (!watchedDevice) return;
+
+    viewerToDevice.delete(ws);
+    const viewers = [...viewerToDevice.entries()].filter(([, d]) => d === watchedDevice).length;
+    deviceViewerCounts.set(watchedDevice, viewers);
+    broadcastViewerCount(watchedDevice);
+}
+
+function scheduleDeviceOffline(deviceId, ws, label) {
+    if (!socketRegistry.isCurrentSocket(deviceId, ws)) {
+        console.log(`[WebSocket] Ignoring stale ${label} for ${deviceId}`);
+        return;
+    }
+
+    const graceTimer = setTimeout(() => {
+        if (!socketRegistry.isCurrentSocket(deviceId, ws)) {
+            console.log(`[WebSocket] Ignoring stale ${label} timer for ${deviceId}`);
+            return;
+        }
+
+        const meta = socketRegistry.getDevice(deviceId)?.metadata;
+        if (meta?.fcmToken) {
+            fcmSender.wakeDevice(meta.fcmToken, deviceId).catch(() => { });
+        }
+
+        if (socketRegistry.markOffline(deviceId, ws)) {
+            console.log(`[WebSocket] Device ${deviceId} marked offline after ${label}`);
+            broadcastToClients(ws, {
+                type: 'device_state',
+                deviceId,
+                state: 'offline'
+            });
+        }
+    }, DEVICE_OFFLINE_GRACE_MS);
+
+    socketRegistry.setPendingOffline(deviceId, graceTimer);
 }
 
 function broadcastBinaryToClients(senderWs, data) {
@@ -631,7 +672,9 @@ function handleWebSocketConnection(ws, req) {
             // Handle heartbeat from device
             if (data.type === 'heartbeat') {
                 if (deviceId) {
+                    const currentStatus = socketRegistry.getDevice(deviceId)?.metadata?.status;
                     socketRegistry.updateMetadata(deviceId, {
+                        ...(currentStatus === 'offline' ? { status: 'online' } : {}),
                         lastHeartbeat: new Date().toISOString(),
                     });
                     safeSend(ws, { type: 'heartbeat_ack' });
@@ -642,7 +685,9 @@ function handleWebSocketConnection(ws, req) {
             // Handle heartbeat pong
             if (data.type === 'pong') {
                 if (deviceId) {
+                    const currentStatus = socketRegistry.getDevice(deviceId)?.metadata?.status;
                     socketRegistry.updateMetadata(deviceId, {
+                        ...(currentStatus === 'offline' ? { status: 'online' } : {}),
                         lastSeen: new Date().toISOString(),
                     });
                 }
@@ -974,21 +1019,13 @@ function handleWebSocketConnection(ws, req) {
         console.log(`[WebSocket] Client disconnected: ${deviceId || 'unknown'}`);
 
         // CAM-010: Clean up viewer tracking
-        const watchedDevice = viewerToDevice.get(ws);
-        if (watchedDevice) {
-            viewerToDevice.delete(ws);
-            const viewers = [...viewerToDevice.entries()].filter(([, d]) => d === watchedDevice).length;
-            deviceViewerCounts.set(watchedDevice, viewers);
-            broadcastViewerCount(watchedDevice);
-        }
+        cleanupViewerTracking(ws);
 
         if (heartbeatInterval) {
             clearInterval(heartbeatInterval);
         }
 
         if (deviceId) {
-            commandDispatcher.clearDeviceCommands(deviceId);
-
             // LOC-009: Grace-period live session clearance — delay 45s to allow reconnect resume
             if (activeLiveSessions.has(deviceId)) {
                 const session = activeLiveSessions.get(deviceId);
@@ -1001,23 +1038,7 @@ function handleWebSocketConnection(ws, req) {
                 console.log(`[LOC-009] Live session for ${deviceId} in grace period (${LIVE_SESSION_GRACE_MS}ms)`);
             }
 
-            const graceTimer = setTimeout(() => {
-                // FCM wake push — device dropped its socket; try to revive it remotely
-                const meta = socketRegistry.getDevice(deviceId)?.metadata;
-                if (meta?.fcmToken) {
-                    fcmSender.wakeDevice(meta.fcmToken, deviceId).catch(() => { });
-                }
-                socketRegistry.markOffline(deviceId);
-            console.log(`[WebSocket] Device ${deviceId} marked offline`);
-
-            // Broadcast offline state to dashboard browsers immediately
-            broadcastToClients(ws, {
-                type: 'device_state',
-                deviceId,
-                state: 'offline'
-            });
-            }, 10_000);
-            socketRegistry.setPendingOffline(deviceId, graceTimer);
+            scheduleDeviceOffline(deviceId, ws, 'close');
         }
     });
 
@@ -1026,36 +1047,13 @@ function handleWebSocketConnection(ws, req) {
         console.error(`[WebSocket] Connection error for ${deviceId || 'unknown'}:`, error.message);
 
         // CAM-010: Clean up viewer tracking
-        const watchedDevice = viewerToDevice.get(ws);
-        if (watchedDevice) {
-            viewerToDevice.delete(ws);
-            const viewers = [...viewerToDevice.entries()].filter(([, d]) => d === watchedDevice).length;
-            deviceViewerCounts.set(watchedDevice, viewers);
-            broadcastViewerCount(watchedDevice);
-        }
+        cleanupViewerTracking(ws);
 
         if (heartbeatInterval) {
             clearInterval(heartbeatInterval);
         }
         if (deviceId) {
-            commandDispatcher.clearDeviceCommands(deviceId);
-            const graceTimer = setTimeout(() => {
-                // FCM wake push — device errored out; try to revive it remotely
-                const meta = socketRegistry.getDevice(deviceId)?.metadata;
-                if (meta?.fcmToken) {
-                    fcmSender.wakeDevice(meta.fcmToken, deviceId).catch(() => { });
-                }
-                socketRegistry.markOffline(deviceId);
-            console.log(`[WebSocket] Device ${deviceId} marked offline after error`);
-
-            // Broadcast offline state to dashboard browsers immediately
-            broadcastToClients(ws, {
-                type: 'device_state',
-                deviceId,
-                state: 'offline'
-            });
-            }, 10_000);
-            socketRegistry.setPendingOffline(deviceId, graceTimer);
+            scheduleDeviceOffline(deviceId, ws, 'error');
         }
     });
 }

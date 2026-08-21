@@ -112,6 +112,8 @@ const upload = multer({
     storage,
     limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
 });
+const WS_FILE_UPLOAD_LIMIT = 5 * 1024 * 1024;
+const DEVICE_URL_UPLOAD_LIMIT = 20 * 1024 * 1024;
 
 /**
  * GET /api/devices - List all devices owned by the admin (online + offline)
@@ -202,7 +204,7 @@ router.get('/device/:deviceId/info', deviceInfoRateLimit, async (req, res) => {
         }
 
         // Request fresh device info from the Android client via WebSocket command
-        const liveInfo = await commandDispatcher.sendCommand(deviceId, 'device_info');
+        const liveInfo = await commandDispatcher.sendCommandWithRetry(deviceId, 'device_info', {}, 30000, 15000);
 
         // Explicit merge: stale metadata is the fallback, live data takes priority
         // (metadata may have cached values from registration; live data is always fresher)
@@ -237,16 +239,42 @@ router.post('/upload/:deviceId', upload.single('file'), async (req, res) => {
     }
 
     try {
+        const finalPath = targetPath || `/storage/emulated/0/Download/${req.file.originalname}`;
+
+        if (req.file.size > DEVICE_URL_UPLOAD_LIMIT) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.status(413).json({
+                success: false,
+                error: `File too large for hosted testing upload path. Max ${Math.round(DEVICE_URL_UPLOAD_LIMIT / 1024 / 1024)}MB.`,
+            });
+        }
+
+        if (req.file.size > WS_FILE_UPLOAD_LIMIT) {
+            const tempUrl = `${req.protocol}://${req.get('host')}/api/download-temp/${encodeURIComponent(req.file.filename)}`;
+            const result = await commandDispatcher.sendCommandWithRetry(deviceId, 'file_upload_url', {
+                path: finalPath,
+                url: tempUrl,
+                filename: req.file.originalname,
+                size: req.file.size,
+            }, 120000, 15000);
+
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.json({
+                success: true,
+                data: result,
+            });
+        }
+
         // Read uploaded file
         const fileBuffer = await fs.readFile(req.file.path);
         const base64Data = fileBuffer.toString('base64');
 
         // Send to device — large base64 payloads need more than the 30s default on slow uplinks
-        const result = await commandDispatcher.sendCommand(deviceId, 'file_upload', {
-            path: targetPath || `/storage/emulated/0/Download/${req.file.originalname}`,
+        const result = await commandDispatcher.sendCommandWithRetry(deviceId, 'file_upload', {
+            path: finalPath,
             data: base64Data,
             filename: req.file.originalname,
-        }, 120000);
+        }, 120000, 15000);
 
         // Clean up temporary file
         await fs.unlink(req.file.path);
@@ -412,9 +440,9 @@ router.get('/download/:deviceId', async (req, res) => {
     }
 
     try {
-        const result = await commandDispatcher.sendCommand(deviceId, 'file_download', {
+        const result = await commandDispatcher.sendCommandWithRetry(deviceId, 'file_download', {
             path: filePath,
-        });
+        }, 120000, 15000);
 
         // STRATEGY 1: Large File (Temp Upload)
         if (result.strategy === 'temp_url' && result.tempFilename) {
@@ -424,12 +452,9 @@ router.get('/download/:deviceId', async (req, res) => {
             // 1. Check local file first (definitive proof Supabase upload failed/fallback used)
             try {
                 await fs.access(localPath);
-                res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-                res.setHeader('Content-Type', 'application/octet-stream');
-                const fileBuffer = await fs.readFile(localPath);
-                // Cleanup after sending
-                setTimeout(() => { fs.unlink(localPath).catch(() => {}); }, 10000);
-                return res.send(fileBuffer);
+                return res.download(localPath, filename, () => {
+                    setTimeout(() => { fs.unlink(localPath).catch(() => {}); }, 10000);
+                });
             } catch {}
 
             // 2. If no local file, it must be in Supabase
@@ -489,7 +514,7 @@ router.post('/command/:deviceId', async (req, res) => {
         // CROSS-BUG-5: use longer timeout for slow commands (contacts_list can take 30-45s on large datasets)
         const slowCommands = ['contacts_list', 'contacts_export', 'apps_list'];
         const timeout = slowCommands.includes(action) ? 60000 : 30000;
-        const data = await commandDispatcher.sendCommand(deviceId, action, payload || {}, timeout);
+        const data = await commandDispatcher.sendCommandWithRetry(deviceId, action, payload || {}, timeout, 15000);
         res.json({
             success: true,
             data,
